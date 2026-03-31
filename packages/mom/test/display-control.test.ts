@@ -187,7 +187,7 @@ describe("mom display control", () => {
 		expect(delegatedMessages).toEqual([]);
 	});
 
-	it("keeps mom-direct-response rendering and upstream delegation intact", async () => {
+	it("renders mom-direct-response to Slack without delegating it upstream", async () => {
 		const { bridge, delegatedMessages, fakeRuntime, originalSendMessage } = createBridgeHarness();
 		const publishFinal = vi.fn(async () => {});
 		const respondInThread = vi.fn(async () => {});
@@ -212,7 +212,7 @@ describe("mom display control", () => {
 
 		expect(publishFinal).toHaveBeenCalledWith("direct response ok", true);
 		expect(respondInThread).toHaveBeenCalledWith("thread response ok");
-		expect(originalSendMessage).toHaveBeenCalledTimes(1);
-		expect(delegatedMessages).toHaveLength(1);
+		expect(originalSendMessage).not.toHaveBeenCalled();
+		expect(delegatedMessages).toEqual([]);
 	});
 });

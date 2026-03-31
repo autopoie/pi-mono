@@ -273,7 +273,16 @@ export function createMomExtensionBridge(
 
 		const callbacks = slackCallbacks;
 		if (!callbacks) {
-			originalSendMessage(message, options);
+			if (message.customType !== DIRECT_RESPONSE_CUSTOM_TYPE) {
+				originalSendMessage(message, options);
+			}
+			return;
+		}
+
+		if (message.customType === DIRECT_RESPONSE_CUSTOM_TYPE) {
+			enqueueSlackEffect(async () => {
+				await renderCustomMessageToSlack(message, callbacks);
+			});
 			return;
 		}
 

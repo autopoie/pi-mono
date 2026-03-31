@@ -61,6 +61,7 @@ The built-in `mom-direct-response` custom type supports:
 - `content.threadText` — optional secondary thread reply
 
 `mom` always renders this custom type to Slack, even when `display: false`.
+`mom` treats this custom type as Slack-only: it does not enter session context or model input.
 
 ### `mom-display-control`
 
