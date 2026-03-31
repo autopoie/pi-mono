@@ -25,6 +25,12 @@ import {
 } from "./agent-internals.js";
 import { createMomSettingsManager, syncLogToSessionManager } from "./context.js";
 import {
+	createMomDisplayState,
+	type MomDisplayState,
+	resolveToolResultDisplay,
+	resolveUsageSummarySlackRender,
+} from "./display-control.js";
+import {
 	createExtensionLoadPlan,
 	createMomExtensionBridge,
 	loadMomExtensions,
@@ -125,6 +131,7 @@ interface RunState {
 	ctx: SlackContext | null;
 	logCtx: { channelId: string; userName?: string; channelName?: string } | null;
 	queue: RunQueue | null;
+	displayState?: MomDisplayState;
 	pendingTools: Map<string, PendingToolState>;
 	totalUsage: UsageTotals;
 	stopReason: string;
@@ -439,8 +446,10 @@ async function runInitializedRunner({
 	runState.stopReason = "stop";
 	runState.errorMessage = undefined;
 	runState.customResponseHandled = false;
+	runState.displayState = createMomDisplayState();
 	state.requestContextRef.current = buildRequestContext(ctx);
 	state.extensionBridge.setRequestContext(state.requestContextRef.current);
+	state.extensionBridge.setDisplayState(runState.displayState);
 	state.extensionBridge.setSlackCallbacks({
 		clearThinking: clearThinkingTimer,
 		markCustomResponseHandled: () => {
@@ -537,10 +546,12 @@ async function runInitializedRunner({
 		clearThinkingTimer();
 		state.requestContextRef.current = undefined;
 		state.extensionBridge.clearRequestContext();
+		state.extensionBridge.clearDisplayState();
 		state.extensionBridge.clearSlackCallbacks();
 		runState.ctx = null;
 		runState.logCtx = null;
 		runState.queue = null;
+		runState.displayState = undefined;
 	}
 }
 
@@ -593,20 +604,24 @@ async function handleSessionEvent({
 		const argsText = pendingTool
 			? formatToolArgsForSlack(toolEvent.toolName, pendingTool.args as Record<string, unknown>)
 			: "(args not found)";
-		const duration = (durationMs / 1000).toFixed(1);
-		let threadMessage = `*${toolEvent.isError ? "✗" : "✓"} ${toolEvent.toolName}*`;
-		if (label) {
-			threadMessage += `: ${label}`;
+		const renderPlan = resolveToolResultSlackRender({
+			displayState: runState.displayState,
+			toolCallId: toolEvent.toolCallId,
+			toolName: toolEvent.toolName,
+			isError: toolEvent.isError,
+			label,
+			argsText,
+			durationMs,
+			resultText,
+		});
+
+		for (const threadMessage of renderPlan.threadMessages) {
+			queue.enqueueMessage(threadMessage, "thread", "tool result thread", false);
 		}
-		threadMessage += ` (${duration}s)\n`;
-		if (argsText) {
-			threadMessage += `\`\`\`\n${argsText}\n\`\`\`\n`;
-		}
-		threadMessage += `*Result:*\n\`\`\`\n${resultText}\n\`\`\``;
-		queue.enqueueMessage(threadMessage, "thread", "tool result thread", false);
-		if (toolEvent.isError) {
+		const mainErrorText = renderPlan.mainErrorText;
+		if (mainErrorText) {
 			clearThinkingTimer();
-			queue.enqueue(() => ctx.respond(`_Error: ${truncate(resultText, 200)}_`, false), "tool error");
+			queue.enqueue(() => ctx.respond(mainErrorText, false), "tool error");
 		}
 		return;
 	}
@@ -749,7 +764,21 @@ async function finalizeRun(
 			: 0;
 		const contextWindow = currentModel.contextWindow || 200000;
 		const summary = log.logUsageSummary(runState.logCtx!, runState.totalUsage, contextTokens, contextWindow);
-		await ctx.respondInThread(summary);
+		const displayState = runState.displayState;
+		if (!displayState) {
+			throw new Error("Missing display state during finalizeRun");
+		}
+		const summaryRender = resolveUsageSummarySlackRender(displayState, summary);
+		for (const threadMessage of summaryRender.threadMessages) {
+			if (runState.queue) {
+				runState.queue.enqueueMessage(threadMessage, "thread", "usage summary thread", false);
+				continue;
+			}
+			await ctx.respondInThread(threadMessage);
+		}
+		if (runState.queue) {
+			await runState.queue.flush();
+		}
 	}
 }
 
@@ -1053,6 +1082,84 @@ function truncate(text: string, maxLength: number): string {
 		return text;
 	}
 	return `${text.substring(0, maxLength - 3)}...`;
+}
+
+export interface ToolResultSlackRenderInput {
+	displayState?: MomDisplayState;
+	toolCallId: string;
+	toolName: string;
+	isError: boolean;
+	label?: string;
+	argsText?: string;
+	durationMs: number;
+	resultText: string;
+}
+
+export interface ToolResultSlackRenderPlan {
+	threadMessages: string[];
+	mainErrorText?: string;
+}
+
+export function buildDefaultToolResultThreadMessage({
+	toolName,
+	isError,
+	label,
+	argsText,
+	durationMs,
+	resultText,
+}: Omit<ToolResultSlackRenderInput, "displayState" | "toolCallId">): string {
+	const duration = (durationMs / 1000).toFixed(1);
+	let threadMessage = `*${isError ? "✗" : "✓"} ${toolName}*`;
+	if (label) {
+		threadMessage += `: ${label}`;
+	}
+	threadMessage += ` (${duration}s)\n`;
+	if (argsText) {
+		threadMessage += `\`\`\`\n${argsText}\n\`\`\`\n`;
+	}
+	threadMessage += `*Result:*\n\`\`\`\n${resultText}\n\`\`\``;
+	return threadMessage;
+}
+
+export function resolveToolResultSlackRender({
+	displayState,
+	toolCallId,
+	toolName,
+	isError,
+	label,
+	argsText,
+	durationMs,
+	resultText,
+}: ToolResultSlackRenderInput): ToolResultSlackRenderPlan {
+	const display = displayState ? resolveToolResultDisplay(displayState, toolCallId) : undefined;
+	const visibleResultText = display?.resultText ?? resultText;
+	const threadMessages: string[] = [];
+
+	if (display?.hideDefault === true) {
+		if (display.threadText) {
+			threadMessages.push(display.threadText);
+		}
+	} else {
+		threadMessages.push(
+			buildDefaultToolResultThreadMessage({
+				toolName,
+				isError,
+				label,
+				argsText,
+				durationMs,
+				resultText: visibleResultText,
+			}),
+		);
+		if (display?.threadText) {
+			threadMessages.push(display.threadText);
+		}
+	}
+
+	return {
+		threadMessages,
+		mainErrorText:
+			isError && display?.hideDefault !== true ? `_Error: ${truncate(visibleResultText, 200)}_` : undefined,
+	};
 }
 
 function extractToolResultText(result: unknown): string {

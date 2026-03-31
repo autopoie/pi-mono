@@ -13,6 +13,13 @@ import {
 
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "fs";
 import { isAbsolute, join, relative, resolve } from "path";
+import {
+	applyMomDisplayInstruction,
+	MOM_DISPLAY_CONTROL_CUSTOM_TYPE,
+	type MomDisplayState,
+	tryParseMomDisplayInstruction,
+} from "./display-control.js";
+import * as log from "./log.js";
 
 type StartupModelSelectSource = "set" | "cycle" | "restore";
 
@@ -97,6 +104,8 @@ export interface MomExtensionBridge {
 	runner?: ExtensionRunner;
 	setRequestContext(requestContext: MomRequestContext): void;
 	clearRequestContext(): void;
+	setDisplayState(state: MomDisplayState): void;
+	clearDisplayState(): void;
 	setSlackCallbacks(callbacks: MomSlackMessageCallbacks): void;
 	clearSlackCallbacks(): void;
 	emitRawInput(text: string, images: ImageContent[] | undefined, source: InputSource): Promise<InputEventResult>;
@@ -223,6 +232,7 @@ export function createMomExtensionBridge(
 	}
 
 	let requestContext: MomRequestContext | undefined;
+	let displayState: MomDisplayState | undefined;
 	let slackCallbacks: MomSlackMessageCallbacks | undefined;
 	let slackEffectChain = Promise.resolve();
 	let pendingSlackEffectError: unknown;
@@ -247,14 +257,29 @@ export function createMomExtensionBridge(
 		});
 	};
 	runtime.sendMessage = (message, options) => {
-		if (!slackCallbacks) {
+		if (message.customType === MOM_DISPLAY_CONTROL_CUSTOM_TYPE) {
+			const instruction = tryParseMomDisplayInstruction(message.details);
+			if (!instruction) {
+				log.logWarning("mom display control", "Dropping invalid mom-display-control message");
+				return;
+			}
+			if (!displayState) {
+				log.logWarning("mom display control", "Dropping mom-display-control message without an active run");
+				return;
+			}
+			applyMomDisplayInstruction(displayState, instruction);
+			return;
+		}
+
+		const callbacks = slackCallbacks;
+		if (!callbacks) {
 			originalSendMessage(message, options);
 			return;
 		}
 
 		enqueueSlackEffect(async () => {
 			try {
-				await renderCustomMessageToSlack(message, slackCallbacks!);
+				await renderCustomMessageToSlack(message, callbacks);
 			} finally {
 				originalSendMessage(message, options);
 			}
@@ -268,6 +293,12 @@ export function createMomExtensionBridge(
 		},
 		clearRequestContext(): void {
 			requestContext = undefined;
+		},
+		setDisplayState(state: MomDisplayState): void {
+			displayState = state;
+		},
+		clearDisplayState(): void {
+			displayState = undefined;
 		},
 		setSlackCallbacks(callbacks: MomSlackMessageCallbacks): void {
 			slackCallbacks = callbacks;
@@ -311,6 +342,8 @@ function createNoOpBridge(): MomExtensionBridge {
 	return {
 		setRequestContext(): void {},
 		clearRequestContext(): void {},
+		setDisplayState(): void {},
+		clearDisplayState(): void {},
 		setSlackCallbacks(): void {},
 		clearSlackCallbacks(): void {},
 		async emitRawInput(): Promise<InputEventResult> {
