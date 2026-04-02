@@ -10,6 +10,7 @@
 
 - Changed mom to read workspace settings from `.pi/settings.json`, ignore workspace extension authorities in strict mode, and post channel mention replies in the triggering Slack thread
 - Changed Slack-only tool-result and usage-summary customization to use mom-local `mom-display-control`, while `tool_result` remains a canonical mutation hook
+- Changed mom startup rehydration to scrub persisted OpenAI Responses replay metadata from restored session context so restart-only reasoning and tool-call item IDs are not carried across pod restarts
 
 ## [0.64.0] - 2026-03-29
 

@@ -1,7 +1,19 @@
+import type { AssistantMessage, ToolResultMessage } from "@mariozechner/pi-ai";
+import type { SessionEntry, SessionMessageEntry } from "@mariozechner/pi-coding-agent";
+
+const RESTART_EPHEMERAL_RESPONSES_APIS = new Set(["openai-responses", "openai-codex-responses"]);
+
 export interface AgentRunResult {
 	stopReason: string;
 	errorMessage?: string;
 	fatalInitializationError?: boolean;
+}
+
+export interface PersistedResponsesReplayScrubStats {
+	assistantMessages: number;
+	thinkingBlocks: number;
+	toolCalls: number;
+	toolResults: number;
 }
 
 export interface AgentSessionPromptInternals {
@@ -71,6 +83,80 @@ export function refreshSessionBaseSystemPromptForRun(session: unknown): AgentRun
 			fatalInitializationError: true,
 		};
 	}
+}
+
+export function scrubPersistedResponsesReplayMetadata(entries: SessionEntry[]): PersistedResponsesReplayScrubStats {
+	const rewrittenToolCallIds = new Map<string, string>();
+	const stats: PersistedResponsesReplayScrubStats = {
+		assistantMessages: 0,
+		thinkingBlocks: 0,
+		toolCalls: 0,
+		toolResults: 0,
+	};
+
+	for (const entry of entries) {
+		if (entry.type !== "message") {
+			continue;
+		}
+
+		const message = (entry as SessionMessageEntry).message;
+		if (message.role === "assistant") {
+			const assistantMessage = message as AssistantMessage;
+			if (!RESTART_EPHEMERAL_RESPONSES_APIS.has(assistantMessage.api)) {
+				continue;
+			}
+			if (!Array.isArray(assistantMessage.content)) {
+				continue;
+			}
+
+			let assistantTouched = false;
+			for (const block of assistantMessage.content) {
+				if (block.type === "thinking" && block.thinkingSignature !== undefined) {
+					delete block.thinkingSignature;
+					stats.thinkingBlocks++;
+					assistantTouched = true;
+					continue;
+				}
+
+				if (block.type === "toolCall") {
+					const separatorIndex = block.id.indexOf("|");
+					if (separatorIndex === -1) {
+						continue;
+					}
+
+					const strippedToolCallId = block.id.slice(0, separatorIndex);
+					if (strippedToolCallId === block.id) {
+						continue;
+					}
+
+					rewrittenToolCallIds.set(block.id, strippedToolCallId);
+					block.id = strippedToolCallId;
+					stats.toolCalls++;
+					assistantTouched = true;
+				}
+			}
+
+			if (assistantTouched) {
+				stats.assistantMessages++;
+			}
+			continue;
+		}
+
+		if (message.role !== "toolResult") {
+			continue;
+		}
+
+		const toolResultMessage = message as ToolResultMessage;
+		const strippedToolCallId = rewrittenToolCallIds.get(toolResultMessage.toolCallId);
+		if (!strippedToolCallId || strippedToolCallId === toolResultMessage.toolCallId) {
+			continue;
+		}
+
+		toolResultMessage.toolCallId = strippedToolCallId;
+		stats.toolResults++;
+	}
+
+	return stats;
 }
 
 export function getAssistantProgressMessages(

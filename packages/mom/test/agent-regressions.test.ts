@@ -1,9 +1,12 @@
+import type { AssistantMessage, ToolResultMessage, Usage } from "@mariozechner/pi-ai";
+import type { SessionEntry, SessionMessageEntry } from "@mariozechner/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 
 import {
 	enqueueAssistantProgressMessages,
 	refreshSessionBaseSystemPrompt,
 	refreshSessionBaseSystemPromptForRun,
+	scrubPersistedResponsesReplayMetadata,
 	shortCircuitHandledPreflight,
 } from "../src/agent-internals.js";
 import {
@@ -12,6 +15,47 @@ import {
 	MAX_THREAD_MESSAGE_LENGTH,
 	publishSplitFinalSlackReply,
 } from "../src/slack-message-utils.js";
+
+function createUsage(): Usage {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			total: 0,
+		},
+	};
+}
+
+function createAssistantEntry(
+	id: string,
+	message: AssistantMessage,
+	parentId: string | null = null,
+): SessionMessageEntry {
+	return {
+		type: "message",
+		id,
+		parentId,
+		timestamp: "2026-04-02T16:00:00.000Z",
+		message,
+	};
+}
+
+function createToolResultEntry(id: string, message: ToolResultMessage, parentId: string): SessionMessageEntry {
+	return {
+		type: "message",
+		id,
+		parentId,
+		timestamp: "2026-04-02T16:00:01.000Z",
+		message,
+	};
+}
 
 describe("mom agent regressions", () => {
 	it("refreshes the canonical base prompt used for extension-enabled turns", () => {
@@ -38,6 +82,165 @@ describe("mom agent regressions", () => {
 			stopReason: "error",
 			errorMessage: "Unsupported @mariozechner/pi-coding-agent AgentSession shape for mom system-prompt refresh",
 			fatalInitializationError: true,
+		});
+	});
+
+	it("scrubs persisted Responses replay metadata while preserving durable assistant metadata", () => {
+		const openAiAssistantEntry = createAssistantEntry("assistant-openai", {
+			role: "assistant",
+			api: "openai-responses",
+			provider: "openai",
+			model: "gpt-5-mini",
+			responseId: "resp_openai",
+			usage: createUsage(),
+			stopReason: "toolUse",
+			timestamp: 1,
+			content: [
+				{ type: "thinking", thinking: "hidden reasoning", thinkingSignature: '{"id":"rs_openai"}' },
+				{
+					type: "text",
+					text: "Need a tool",
+					textSignature: '{"v":1,"id":"msg_openai","phase":"commentary"}',
+				},
+				{
+					type: "toolCall",
+					id: "call_openai|fc_openai",
+					name: "read",
+					arguments: { path: "README.md" },
+				},
+			],
+		});
+		const openAiToolResultEntry = createToolResultEntry(
+			"tool-openai",
+			{
+				role: "toolResult",
+				toolCallId: "call_openai|fc_openai",
+				toolName: "read",
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				timestamp: 2,
+			},
+			"assistant-openai",
+		);
+		const codexAssistantEntry = createAssistantEntry(
+			"assistant-codex",
+			{
+				role: "assistant",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				model: "gpt-5.2-codex",
+				responseId: "resp_codex",
+				usage: createUsage(),
+				stopReason: "toolUse",
+				timestamp: 3,
+				content: [
+					{ type: "thinking", thinking: "codex reasoning", thinkingSignature: '{"id":"rs_codex"}' },
+					{ type: "text", text: "Need another tool", textSignature: "msg_codex" },
+					{
+						type: "toolCall",
+						id: "call_codex|fc_codex",
+						name: "edit",
+						arguments: { path: "README.md" },
+					},
+				],
+			},
+			"tool-openai",
+		);
+		const codexToolResultEntry = createToolResultEntry(
+			"tool-codex",
+			{
+				role: "toolResult",
+				toolCallId: "call_codex|fc_codex",
+				toolName: "edit",
+				content: [{ type: "text", text: "patched" }],
+				isError: false,
+				timestamp: 4,
+			},
+			"assistant-codex",
+		);
+		const azureAssistantEntry = createAssistantEntry(
+			"assistant-azure",
+			{
+				role: "assistant",
+				api: "azure-openai-responses",
+				provider: "azure-openai-responses",
+				model: "gpt-5",
+				responseId: "resp_azure",
+				usage: createUsage(),
+				stopReason: "toolUse",
+				timestamp: 5,
+				content: [
+					{ type: "thinking", thinking: "keep me", thinkingSignature: '{"id":"rs_azure"}' },
+					{ type: "text", text: "Azure text", textSignature: "msg_azure" },
+					{
+						type: "toolCall",
+						id: "call_azure|fc_azure",
+						name: "bash",
+						arguments: { command: "pwd" },
+					},
+				],
+			},
+			"tool-codex",
+		);
+		const entries: SessionEntry[] = [
+			openAiAssistantEntry,
+			openAiToolResultEntry,
+			codexAssistantEntry,
+			codexToolResultEntry,
+			azureAssistantEntry,
+		];
+
+		const stats = scrubPersistedResponsesReplayMetadata(entries);
+		const openAiAssistant = openAiAssistantEntry.message as AssistantMessage;
+		const openAiToolResult = openAiToolResultEntry.message as ToolResultMessage;
+		const codexAssistant = codexAssistantEntry.message as AssistantMessage;
+		const codexToolResult = codexToolResultEntry.message as ToolResultMessage;
+		const azureAssistant = azureAssistantEntry.message as AssistantMessage;
+
+		expect(stats).toEqual({
+			assistantMessages: 2,
+			thinkingBlocks: 2,
+			toolCalls: 2,
+			toolResults: 2,
+		});
+		expect(openAiAssistant.content[0]).toEqual({ type: "thinking", thinking: "hidden reasoning" });
+		expect(openAiAssistant.content[1]).toEqual({
+			type: "text",
+			text: "Need a tool",
+			textSignature: '{"v":1,"id":"msg_openai","phase":"commentary"}',
+		});
+		expect(openAiAssistant.content[2]).toEqual({
+			type: "toolCall",
+			id: "call_openai",
+			name: "read",
+			arguments: { path: "README.md" },
+		});
+		expect(openAiAssistant.responseId).toBe("resp_openai");
+		expect(openAiToolResult.toolCallId).toBe("call_openai");
+		expect(codexAssistant.content[0]).toEqual({ type: "thinking", thinking: "codex reasoning" });
+		expect(codexAssistant.content[1]).toEqual({
+			type: "text",
+			text: "Need another tool",
+			textSignature: "msg_codex",
+		});
+		expect(codexAssistant.content[2]).toEqual({
+			type: "toolCall",
+			id: "call_codex",
+			name: "edit",
+			arguments: { path: "README.md" },
+		});
+		expect(codexAssistant.responseId).toBe("resp_codex");
+		expect(codexToolResult.toolCallId).toBe("call_codex");
+		expect(azureAssistant.content[0]).toEqual({
+			type: "thinking",
+			thinking: "keep me",
+			thinkingSignature: '{"id":"rs_azure"}',
+		});
+		expect(azureAssistant.content[2]).toEqual({
+			type: "toolCall",
+			id: "call_azure|fc_azure",
+			name: "bash",
+			arguments: { command: "pwd" },
 		});
 	});
 

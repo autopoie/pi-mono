@@ -21,6 +21,7 @@ import { join } from "path";
 import {
 	enqueueAssistantProgressMessages,
 	refreshSessionBaseSystemPromptForRun,
+	scrubPersistedResponsesReplayMetadata,
 	shortCircuitHandledPreflight,
 } from "./agent-internals.js";
 import { createMomSettingsManager, syncLogToSessionManager } from "./context.js";
@@ -272,6 +273,15 @@ async function initializeRunner({
 	const initialSystemPrompt = buildSystemPrompt(workspacePath, channelId, memory, sandboxConfig, [], [], skills);
 	const contextFile = join(channelDir, "context.jsonl");
 	const sessionManager = SessionManager.open(contextFile, channelDir);
+	// SessionManager.getEntries() returns the live loaded entries via a shallow-copy array,
+	// so scrubbing here updates the in-memory restored history without rewriting context.jsonl
+	const replayMetadataScrubStats = scrubPersistedResponsesReplayMetadata(sessionManager.getEntries());
+	if (replayMetadataScrubStats.assistantMessages > 0) {
+		log.logInfo(
+			`[${channelId}] Scrubbed persisted Responses replay metadata from ${replayMetadataScrubStats.assistantMessages} assistant messages ` +
+				`(${replayMetadataScrubStats.thinkingBlocks} thinking blocks, ${replayMetadataScrubStats.toolCalls} tool calls, ${replayMetadataScrubStats.toolResults} tool results)`,
+		);
+	}
 	const settingsManager = createMomSettingsManager(workspaceDir);
 	const authStorage = AuthStorage.create(join(homedir(), ".pi", "mom", "auth.json"));
 	const modelRegistry = ModelRegistry.create(authStorage);
