@@ -17,6 +17,7 @@ A Slack bot powered by an LLM that can execute bash commands, read/write files, 
 
 - [Artifacts Server](docs/artifacts-server.md) - Share HTML/JS visualizations publicly with live reload
 - [Events System](docs/events.md) - Schedule reminders and periodic tasks
+- [Extensions and Trust Model](docs/extensions.md) - Trusted roots, strict mode, and Slack hook behavior
 - [Sandbox Guide](docs/sandbox.md) - Docker vs host mode security
 - [Slack Bot Setup](docs/slack-bot-minimal-guide.md) - Minimal Slack integration guide
 
@@ -62,9 +63,17 @@ npm install @mariozechner/pi-mom
 # Set environment variables
 export MOM_SLACK_APP_TOKEN=xapp-...
 export MOM_SLACK_BOT_TOKEN=xoxb-...
-# Option 1: Anthropic API key
-export ANTHROPIC_API_KEY=sk-ant-...
-# Option 2: use /login command in pi agent, then copy/link auth.json to ~/.pi/mom/
+
+# Select a startup model/provider
+export MOM_MODEL=openai:gpt-5.4-mini
+
+# Set the matching provider credential
+export OPENAI_API_KEY=sk-...
+
+# Optional: enable strict trusted-extension mode
+export MOM_TRUSTED_EXTENSION_ROOT=/absolute/path/outside/your-workspace
+
+# Or use /login in pi, then copy/link auth.json to ~/.pi/mom/
 
 # Create Docker sandbox (recommended)
 docker run -d \
@@ -95,51 +104,72 @@ Options:
 |----------|-------------|
 | `MOM_SLACK_APP_TOKEN` | Slack app-level token (xapp-...) |
 | `MOM_SLACK_BOT_TOKEN` | Slack bot token (xoxb-...) |
-| `ANTHROPIC_API_KEY` | (Optional) Anthropic API key |
+| `MOM_MODEL` | Optional startup model in `provider:model` form |
+| Provider API key env vars | Optional provider credentials such as `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` |
+| `MOM_TRUSTED_EXTENSION_ROOT` | Optional absolute trusted extension root outside the workspace; enables strict mode |
 
 ## Authentication
 
-Mom needs credentials for Anthropic API. The options to set it are:
+Mom resolves credentials from the selected model's provider. If `MOM_MODEL=openai:gpt-5.4-mini`, mom looks up OpenAI credentials. If the startup model is Anthropic, mom looks up Anthropic credentials.
+
+You can provide credentials in two ways:
 
 1. **Environment Variable**
 ```bash
+export OPENAI_API_KEY=sk-...
+# or
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-2. **OAuth Login via coding agent command** (Recommended for Claude Pro/Max)
-
+2. **OAuth Login via coding agent command**
 - run interactive coding agent session: `npx @mariozechner/pi-coding-agent`
 - enter `/login` command
-  - choose "Anthropic" provider
-  - follow instructions in the browser
+- choose the provider you want mom to use
+- follow instructions in the browser
 - link `auth.json` to mom: `ln -s ~/.pi/agent/auth.json ~/.pi/mom/auth.json`
+
+## Extensions and model selection
+
+Workspace settings live at `<workspace>/.pi/settings.json`.
+- `MOM_MODEL=provider:model` selects the startup model without changing workspace defaults
+- `mom` resolves provider credentials from the selected model
+- channel mention replies are posted in the triggering Slack thread, with one persisted session context per mention thread
+- mention-thread sessions use isolated session files, and execution is serialized per Slack channel because mutable workspace state is channel-scoped
+- set `MOM_TRUSTED_EXTENSION_ROOT=/absolute/path/outside/workspace` to load extensions only from that trusted root
+- in strict mode, workspace `extensions` and `packages` entries do not affect extension loading
+- without strict mode, `mom` loads extensions from `workspace/.pi/settings.json` `extensions` and `workspace/.pi/extensions`
+
+See [docs/extensions.md](docs/extensions.md) for extension discovery, trust settings, and Slack bridge behavior.
 
 ## How Mom Works
 
 Mom is a Node.js app that runs on your host machine. She connects to Slack via Socket Mode, receives messages, and responds using an LLM-based agent that can create and use tools.
 
-**For each channel you add mom to** (group channels or DMs), mom maintains a separate conversation history with its own context, memory, and files.
+**For each DM**, mom maintains one channel-scoped conversation history. **For public and private channels**, mom stores channel assets together and persists a separate conversation session per @mention thread. Execution is serialized per Slack channel because memory, skills, scratch space, uploads, and other mutable workspace state are channel-scoped.
 
 **When a message arrives in a channel:**
 - The message is written to the channel's `log.jsonl`, retaining full channel history
+- Channel log entries record the normalized Slack thread root, so mom can later replay only the relevant thread into a thread-scoped session
 - If the message has attachments, they are stored in the channel's `attachments/` folder for mom to access
-- Mom can later search the `log.jsonl` file for previous conversations and reference the attachments
+- For mention threads, mom also derives a scoped `history.jsonl` inside the thread session directory so older-history lookups stay thread-local by default
+- The channel-wide `log.jsonl` remains available when you explicitly ask for broader channel context
 
 **When you @mention mom (or DM her), she:**
-1. Syncs all unseen messages from `log.jsonl` into `context.jsonl`. The context is what mom actually sees in terms of content when she responds
+1. Syncs unseen messages from the channel `log.jsonl` into the active conversation `context.jsonl`. DMs use channel-scoped conversations; channel mentions sync only the current thread into that thread's persisted session
 2. Loads **memory** from MEMORY.md files (global and channel-specific)
 3. Responds to your request, dynamically using tools to answer it:
    - Read attachments and analyze them
    - Invoke command line tools, e.g. to read your emails
    - Write new files or programs
    - Attach files to her response
-4. Any files or tools mom creates are stored in the channel's directory
-5. Mom's direct reply is stored in `log.jsonl`, while details like tool call results are kept in `context.jsonl` which she'll see and thus "remember" on subsequent requests
+4. Any files or tools mom creates are stored in the channel's directory, and only one run executes at a time per channel because that workspace state is shared across threads
+5. Mom's direct reply is stored in `log.jsonl`, while details like tool call results are kept in the active conversation's `context.jsonl` so she'll "remember" them on later turns in that DM or mention thread
 
 **Context Management:**
 - Mom has limited context depending on the LLM model used. E.g. Claude Opus or Sonnet 4.5 can process a maximum of 200k tokens
 - When the context exceeds the LLM's context window size, mom compacts the context: keeps recent messages and tool results in full, summarizes older ones
-- For older history beyond context, mom can grep `log.jsonl` for infinite searchable history
+- For older history beyond context, mom uses the conversation-specific history view for the current run: DMs query channel `log.jsonl`, while mention threads default to their derived `history.jsonl`
+- Legacy channel-scoped mention history is not auto-migrated into per-thread sessions. If a thread-specific session does not exist yet, mom starts a fresh isolated thread session and logs that reset in the host process
 
 Everything mom does happens in a workspace you control. This is a single directory that's the only directory she can access on your host machine (when in Docker mode). You can inspect logs, memory, and tools she creates anytime.
 
@@ -181,29 +211,38 @@ You never need to manually install dependencies. Just ask mom and she'll set it 
 You provide mom with a **data directory** (e.g., `./data`) as her workspace. While mom can technically access any directory in her execution environment, she's instructed to store all her work here:
 
 ```
-./data/                         # Your host directory
-  ├── MEMORY.md                 # Global memory (shared across channels)
-  ├── settings.json             # Global settings (compaction, retry, etc.)
-  ├── skills/                   # Global custom CLI tools mom creates
-  ├── C123ABC/                  # Each Slack channel gets a directory
-  │   ├── MEMORY.md             # Channel-specific memory
-  │   ├── log.jsonl             # Full message history (source of truth)
-  │   ├── context.jsonl         # LLM context (synced from log.jsonl)
-  │   ├── attachments/          # Files users shared
-  │   ├── scratch/              # Mom's working directory
-  │   └── skills/               # Channel-specific CLI tools
-  └── D456DEF/                  # DM channels also get directories
+./data/                             # Your host directory
+  ├── .pi/
+  │   └── settings.json             # Workspace settings (model defaults, hideThinkingBlock, extensions)
+  ├── MEMORY.md                     # Global memory (shared across channels)
+  ├── skills/                       # Global custom CLI tools mom creates
+  ├── C123ABC/                      # Channel-scoped assets for a public/private Slack channel
+  │   ├── MEMORY.md                 # Channel-specific memory
+  │   ├── log.jsonl                 # Full channel message history (source of truth)
+  │   ├── attachments/              # Files users shared
+  │   ├── scratch/                  # Mom's shared working directory for this channel
+  │   ├── skills/                   # Channel-specific CLI tools
+  │   └── sessions/
+  │       ├── 1000.1/
+  │       │   ├── context.jsonl     # LLM context for one @mention thread
+  │       │   ├── history.jsonl     # Derived older-history view for this thread
+  │       │   └── last_prompt.jsonl
+  │       └── 2000.1/
+  │           └── ...
+  └── D456DEF/                      # DM channels use channel-scoped sessions
+      ├── context.jsonl
       └── ...
 ```
 
 **What's stored here:**
 - `log.jsonl`: All channel messages (user messages, bot responses). Source of truth.
-- `context.jsonl`: Messages sent to the LLM. Synced from log.jsonl at each run start.
+- `context.jsonl`: Messages sent to the LLM for one persisted conversation. In channels this lives under `sessions/<threadRootTs>/`; in DMs it stays at the channel root.
+- `history.jsonl`: Derived older-history view for one mention thread. This is regenerated from the channel log at run start and keeps default thread history queries scoped to that thread.
 - Memory files: Context mom remembers across sessions
 - Custom tools/scripts mom creates (aka "skills")
 - Working files, cloned repos, generated output
 
-Mom efficiently greps `log.jsonl` for conversation history, giving her essentially infinite context beyond what's in `context.jsonl`.
+Mom efficiently queries the conversation-specific history view for older context, while the channel-wide `log.jsonl` remains available when you explicitly need broader channel history.
 
 ### Memory
 
@@ -342,8 +381,9 @@ Mom can schedule events that wake her up at specific times or when external thin
 1. Mom (or a program she writes) creates a JSON file in `data/events/`
 2. The harness detects the file and schedules it
 3. When due, mom receives a message: `[EVENT:filename:type:schedule] text`
-4. Immediate and one-shot events are auto-deleted after triggering
-5. Periodic events persist until explicitly deleted
+4. Events are channel-scoped wakeups: they do not resume the Slack thread that created them, and stop/busy applies across the whole channel while an event is running
+5. Immediate and one-shot events are auto-deleted after triggering
+6. Periodic events persist until explicitly deleted
 
 **Silent completion:** For periodic events that check for activity (inbox, notifications), mom may find nothing to report. She can respond with just `[SILENT]` to delete the status message and post nothing to Slack. This prevents channel spam from periodic checks.
 
@@ -368,19 +408,24 @@ Update mom anytime with `npm install -g @mariozechner/pi-mom`. This only updates
 
 ## Message History
 
-Mom uses two files per channel to manage conversation history:
+Mom uses one log per channel and one context file per active conversation scope:
 
 **log.jsonl** ([format](../../src/store.ts)) (source of truth):
 - All messages from users and mom (no tool results)
-- Custom JSONL format with timestamps, user info, text, attachments
+- Custom JSONL format with timestamps, user info, text, attachments, and normalized `threadRootTs` for channel-thread messages
 - Append-only, never compacted
 - Used for syncing to context and searching older history
 
 **context.jsonl** ([format](../../src/context.ts)) (LLM context):
 - What's sent to the LLM (includes tool results and full history)
-- Auto-synced from `log.jsonl` before each @mention (picks up backfilled messages, channel chatter)
+- One file per persisted conversation: DMs use `<channel>/context.jsonl`, channel mentions use `<channel>/sessions/<threadRootTs>/context.jsonl`
+- Auto-synced from the channel `log.jsonl` before each run; channel mention sessions replay only matching-thread user messages while DMs keep channel-wide behavior
 - When context exceeds the LLM's context window size, mom compacts it: keeps recent messages and tool results in full, summarizes older ones into a compaction event. On subsequent requests, the LLM gets the summary + recent messages from the compaction point onward
-- Mom can grep `log.jsonl` for older history beyond what's in context
+
+**history.jsonl** (thread-scoped older-history view):
+- Generated under `<channel>/sessions/<threadRootTs>/history.jsonl` for mention-thread runs
+- Derived from the channel `log.jsonl`, but filtered to one `threadRootTs`
+- Used as the default older-history query surface for thread-scoped sessions so ad hoc history lookups stay local to the current thread unless you explicitly ask for broader channel context
 
 ## Security Considerations
 

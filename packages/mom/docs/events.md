@@ -109,11 +109,13 @@ If the agent errors while processing an event:
 
 ## Queue Integration
 
-Events integrate with the existing `ChannelQueue` in `SlackBot`:
+Events integrate with the existing channel execution queueing in `SlackBot`:
 
 - New method: `SlackBot.enqueueEvent(event: SlackEvent)` — always queues, no "already working" rejection
 - Maximum 5 events can be queued per channel. If queue is full, discard and log to console.
-- User @mom mentions retain current behavior: rejected with "Already working" message if agent is busy
+- User DMs are still channel-scoped
+- User @mom mentions keep per-thread persisted session context, but execution still serializes per Slack channel because mutable workspace state remains channel-scoped
+- Events remain channel-scoped wakeups and do not resume the Slack thread that created them
 
 When an event triggers:
 1. Create a synthetic `SlackEvent` with formatted message
@@ -154,7 +156,7 @@ The filename is used as an identifier for tracking timers and in the event messa
 ### Files
 
 - `src/events.ts` — Event parsing, timer management, fs watching
-- `src/slack.ts` — Add `enqueueEvent()` method and `size()` to `ChannelQueue`
+- `src/slack.ts` — Add `enqueueEvent()` and per-channel queue sizing for event admission control
 - `src/main.ts` — Initialize events watcher on startup
 - `src/agent.ts` — Update system prompt with events documentation
 
@@ -220,6 +222,7 @@ The following should be added to mom's system prompt:
 ## Events
 
 You can schedule events that wake you up at specific times or when external things happen. Events are JSON files in `/workspace/events/`.
+Events are channel-scoped wakeups. They do not preserve the Slack thread context that created them, and while an event is running, stop/busy applies across the whole channel.
 
 ### Event Types
 
