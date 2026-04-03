@@ -12,6 +12,10 @@ export interface ConversationScope {
 	threadRootTs?: string;
 }
 
+export function resolveExecutionChannelId(scope: ConversationScope): string {
+	return scope.channelId;
+}
+
 export function resolveConversationScope(
 	input: ConversationScopeInput,
 	options?: { isEvent?: boolean },

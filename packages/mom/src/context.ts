@@ -25,6 +25,7 @@ interface LogMessage {
 	ts?: string;
 	user?: string;
 	userName?: string;
+	displayName?: string;
 	text?: string;
 	isBot?: boolean;
 	threadRootTs?: string;
@@ -38,6 +39,21 @@ interface ParsedLogLine {
 export interface HistoryAccessTarget {
 	historyFile: string;
 	mode: "channel-log" | "thread-history" | "thread-filtered-channel-log";
+}
+
+export interface LegacyThreadHistoryState {
+	hasLegacyChannelContext: boolean;
+	hasLegacyThreadlessLogEntries: boolean;
+	shouldWarn: boolean;
+}
+
+export interface ThreadRootMessage {
+	ts: string;
+	user: string;
+	userName?: string;
+	displayName?: string;
+	text: string;
+	isBot: boolean;
 }
 
 function readParsedLogLines(channelDir: string): ParsedLogLine[] {
@@ -80,6 +96,75 @@ function normalizeUserContentForSync(content: string): string {
 		normalized = normalized.substring(0, attachmentsIdx);
 	}
 	return normalized;
+}
+
+function isLegacyThreadlessMentionLogEntry(message: LogMessage): boolean {
+	return message.threadRootTs === undefined && message.isBot !== true && message.user !== "EVENT";
+}
+
+export function inspectLegacyThreadHistoryState(
+	channelDir: string,
+	sessionDir: string,
+	scope: ConversationScope,
+): LegacyThreadHistoryState {
+	if (scope.kind !== "thread") {
+		return {
+			hasLegacyChannelContext: false,
+			hasLegacyThreadlessLogEntries: false,
+			shouldWarn: false,
+		};
+	}
+
+	const sessionContextFile = join(sessionDir, "context.jsonl");
+	if (existsSync(sessionContextFile)) {
+		return {
+			hasLegacyChannelContext: false,
+			hasLegacyThreadlessLogEntries: false,
+			shouldWarn: false,
+		};
+	}
+
+	const hasLegacyChannelContext = existsSync(join(channelDir, "context.jsonl"));
+	const hasLegacyThreadlessLogEntries = readParsedLogLines(channelDir).some(({ message }) =>
+		isLegacyThreadlessMentionLogEntry(message),
+	);
+	return {
+		hasLegacyChannelContext,
+		hasLegacyThreadlessLogEntries,
+		shouldWarn: hasLegacyThreadlessLogEntries,
+	};
+}
+
+export function readThreadRootMessage(channelDir: string, scope: ConversationScope): ThreadRootMessage | undefined {
+	if (scope.kind !== "thread") {
+		return undefined;
+	}
+
+	const threadRootTs = scope.threadRootTs;
+	if (!threadRootTs) {
+		return undefined;
+	}
+
+	let latestMatch: ThreadRootMessage | undefined;
+	for (const { message } of readParsedLogLines(channelDir)) {
+		const slackTs = message.ts;
+		const user = message.user;
+		const text = message.text;
+		if (slackTs !== threadRootTs || typeof text !== "string" || typeof user !== "string") {
+			continue;
+		}
+
+		latestMatch = {
+			ts: slackTs,
+			user,
+			userName: message.userName,
+			displayName: message.displayName,
+			text,
+			isBot: message.isBot === true,
+		};
+	}
+
+	return latestMatch;
 }
 
 export function prepareHistoryAccessTarget(

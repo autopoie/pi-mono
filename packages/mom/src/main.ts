@@ -2,9 +2,15 @@
 
 import { join, resolve } from "path";
 import { type AgentRunner, createRunner } from "./agent.js";
-import type { ConversationScope } from "./conversation-scope.js";
+import { type ConversationScope, resolveExecutionChannelId } from "./conversation-scope.js";
 import { downloadChannel } from "./download.js";
 import { createEventsWatcher } from "./events.js";
+import {
+	abortActiveRunAndRequestStopStatus,
+	type ConversationMessageTarget,
+	publishStoppedStatus,
+	resolveConversationMessageTarget,
+} from "./execution-control.js";
 import { resolveMomTrustConfig, validateStrictTrustBoundary } from "./extensions.js";
 import * as log from "./log.js";
 import { parseSandboxArg, type SandboxConfig, validateSandbox } from "./sandbox.js";
@@ -35,14 +41,22 @@ interface ParsedArgs {
 }
 
 interface ConversationState {
-	running: boolean;
 	runner?: AgentRunner;
 	store: ChannelStore;
-	stopRequested: boolean;
-	stopMessageTs?: string;
 	channelDir: string;
 	sessionDir: string;
 	conversationKey: string;
+}
+
+interface ChannelExecutionState {
+	running: boolean;
+	activeRunner?: AgentRunner;
+	activeTarget?: ConversationMessageTarget;
+	activeRunId: number;
+	stopRequested: boolean;
+	stopMessageTs?: string;
+	stopStatusRequestId?: number;
+	stopStatusPromise?: Promise<string | undefined>;
 }
 
 function parseArgs(): ParsedArgs {
@@ -110,6 +124,7 @@ if (trustConfig.strict) {
 }
 
 const conversationStates = new Map<string, ConversationState>();
+const channelExecutionStates = new Map<string, ChannelExecutionState>();
 
 function getState(scope: ConversationScope): ConversationState {
 	let state = conversationStates.get(scope.key);
@@ -117,14 +132,25 @@ function getState(scope: ConversationScope): ConversationState {
 		const channelDir = join(workingDir, scope.channelId);
 		const sessionDir = scope.kind === "thread" ? join(channelDir, "sessions", scope.threadRootTs!) : channelDir;
 		state = {
-			running: false,
 			store: new ChannelStore({ workingDir, botToken: MOM_SLACK_BOT_TOKEN! }),
-			stopRequested: false,
 			channelDir,
 			sessionDir,
 			conversationKey: scope.key,
 		};
 		conversationStates.set(scope.key, state);
+	}
+	return state;
+}
+
+function getChannelExecutionState(channelId: string): ChannelExecutionState {
+	let state = channelExecutionStates.get(channelId);
+	if (!state) {
+		state = {
+			running: false,
+			activeRunId: 0,
+			stopRequested: false,
+		};
+		channelExecutionStates.set(channelId, state);
 	}
 	return state;
 }
@@ -318,17 +344,22 @@ function createSlackContext(
 }
 
 const handler: MomHandler = {
-	isRunning(conversationKey: string): boolean {
-		const state = conversationStates.get(conversationKey);
+	isRunning(channelId: string): boolean {
+		const state = channelExecutionStates.get(channelId);
 		return state?.running ?? false;
 	},
 
 	async handleStop(event: SlackEvent, scope: ConversationScope, slack: SlackBot): Promise<void> {
-		const state = conversationStates.get(scope.key);
-		if (state?.running && state.runner) {
-			state.stopRequested = true;
-			state.runner.abort();
-			state.stopMessageTs = await slack.postConversationMessage(event.channel, scope.threadRootTs, "_Stopping..._");
+		const executionState = channelExecutionStates.get(resolveExecutionChannelId(scope));
+		if (executionState?.running && executionState.activeRunner) {
+			const activeRunner = executionState.activeRunner;
+			abortActiveRunAndRequestStopStatus({
+				slack,
+				executionState,
+				requesterScope: scope,
+				abort: () => activeRunner.abort(),
+				onWarning: (summary, detail) => log.logWarning(`[${scope.key}] ${summary}`, detail),
+			});
 			return;
 		}
 
@@ -338,8 +369,15 @@ const handler: MomHandler = {
 	async handleEvent(event: SlackEvent, scope: ConversationScope, slack: SlackBot, isEvent = false): Promise<void> {
 		const state = getState(scope);
 		const runner = ensureRunner(state, scope);
-		state.running = true;
-		state.stopRequested = false;
+		const executionState = getChannelExecutionState(resolveExecutionChannelId(scope));
+		executionState.running = true;
+		executionState.activeRunId += 1;
+		executionState.activeRunner = runner;
+		executionState.activeTarget = resolveConversationMessageTarget(scope);
+		executionState.stopRequested = false;
+		executionState.stopMessageTs = undefined;
+		executionState.stopStatusRequestId = undefined;
+		executionState.stopStatusPromise = undefined;
 
 		log.logInfo(`[${scope.key}] Starting run: ${event.text.substring(0, 50)}`);
 
@@ -352,18 +390,30 @@ const handler: MomHandler = {
 				state.runner = undefined;
 			}
 
-			if (result.stopReason === "aborted" && state.stopRequested) {
-				if (state.stopMessageTs) {
-					await slack.updateMessage(event.channel, state.stopMessageTs, "_Stopped_");
-					state.stopMessageTs = undefined;
-				} else {
-					await slack.postConversationMessage(event.channel, scope.threadRootTs, "_Stopped_");
+			if (result.stopReason === "aborted" && executionState.stopRequested) {
+				try {
+					await publishStoppedStatus({
+						slack,
+						executionState,
+						fallbackScope: scope,
+					});
+				} catch (error) {
+					log.logWarning(
+						`[${scope.key}] Stop status update failed`,
+						error instanceof Error ? error.message : String(error),
+					);
 				}
 			}
 		} catch (error) {
 			log.logWarning(`[${scope.key}] Run error`, error instanceof Error ? error.message : String(error));
 		} finally {
-			state.running = false;
+			executionState.running = false;
+			executionState.activeRunner = undefined;
+			executionState.activeTarget = undefined;
+			executionState.stopRequested = false;
+			executionState.stopMessageTs = undefined;
+			executionState.stopStatusRequestId = undefined;
+			executionState.stopStatusPromise = undefined;
 		}
 	},
 };

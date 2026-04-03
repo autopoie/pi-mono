@@ -27,8 +27,11 @@ import {
 import {
 	createMomSettingsManager,
 	type HistoryAccessTarget,
+	inspectLegacyThreadHistoryState,
 	prepareHistoryAccessTarget,
+	readThreadRootMessage,
 	syncLogToSessionManager,
+	type ThreadRootMessage,
 } from "./context.js";
 import type { ConversationScope } from "./conversation-scope.js";
 import {
@@ -462,6 +465,14 @@ async function runInitializedRunner({
 }): Promise<AgentRunResult> {
 	await mkdir(sessionDir, { recursive: true });
 
+	const legacyThreadHistoryState = inspectLegacyThreadHistoryState(channelDir, sessionDir, conversationScope);
+	if (legacyThreadHistoryState.shouldWarn) {
+		log.logWarning(
+			`[${conversationKey}] Legacy mention-thread history requires a reset`,
+			"Older channel-scoped mention history from before thread-scoped sessions cannot be replayed automatically",
+		);
+	}
+
 	const syncedCount = syncLogToSessionManager(state.sessionManager, channelDir, conversationScope, ctx.message.ts);
 	if (syncedCount > 0) {
 		log.logInfo(`[${conversationKey}] Synced ${syncedCount} messages from log.jsonl`);
@@ -567,7 +578,11 @@ async function runInitializedRunner({
 	log.logInfo(`Context sizes - system: ${state.systemPromptRef.current.length} chars, memory: ${memory.length} chars`);
 	log.logInfo(`Channels: ${ctx.channels.length}, Users: ${ctx.users.length}`);
 
-	const { promptText, imageAttachments } = buildPromptInput(ctx, state.workspacePath);
+	const threadRootMessage =
+		conversationScope.kind === "thread" && ctx.message.ts !== conversationScope.threadRootTs
+			? readThreadRootMessage(channelDir, conversationScope)
+			: undefined;
+	const { promptText, imageAttachments } = buildPromptInput(ctx, state.workspacePath, threadRootMessage);
 	const debugContext = {
 		systemPrompt: state.systemPromptRef.current,
 		messages: state.session.messages,
@@ -591,7 +606,7 @@ async function runInitializedRunner({
 		let promptImages = imageAttachments;
 		if (preflight.action === "transform") {
 			promptImages = preflight.images ?? promptImages;
-			promptTextForSession = rebuildSlackPrompt(ctx, state.workspacePath, preflight.text);
+			promptTextForSession = rebuildSlackPrompt(ctx, state.workspacePath, preflight.text, threadRootMessage);
 		}
 
 		armThinkingTimer(ctx, state.settingsManager.getHideThinkingBlock());
@@ -1154,6 +1169,7 @@ ${skills.length > 0 ? formatSkillsForPrompt(skills) : "(no skills installed yet)
 
 ## Events
 You can schedule events that wake you up at specific times or when external things happen. Events are JSON files in \`${workspacePath}/events/\`.
+Events are channel-scoped wakeups. They do not preserve the Slack thread context that created them, and while an event is running, stop/busy applies across the whole channel.
 
 ### Event Types
 
@@ -1402,12 +1418,21 @@ function formatToolArgsForSlack(_toolName: string, args: Record<string, unknown>
 	return lines.join("\n");
 }
 
-function buildPromptInput(
+export function formatThreadRootMessageForPrompt(threadRootMessage: ThreadRootMessage): string {
+	const author = threadRootMessage.userName || threadRootMessage.displayName || threadRootMessage.user;
+	return `<slack_thread_root_message>\nThis Slack thread is rooted at the message below. When the user refers to the root message above, they mean this message.\n[${author}]: ${threadRootMessage.text}\n</slack_thread_root_message>`;
+}
+
+export function buildPromptInput(
 	ctx: SlackContext,
 	workspacePath: string,
+	threadRootMessage?: ThreadRootMessage,
 ): { promptText: string; imageAttachments: ImageContent[] } {
 	const timestamp = buildSlackTimestamp();
 	let promptText = `[${timestamp}] [${ctx.message.userName || "unknown"}]: ${ctx.message.text}`;
+	if (threadRootMessage) {
+		promptText = `${formatThreadRootMessageForPrompt(threadRootMessage)}\n\n${promptText}`;
+	}
 	const imageAttachments: ImageContent[] = [];
 	const nonImagePaths: string[] = [];
 
@@ -1436,7 +1461,12 @@ function buildPromptInput(
 	return { promptText, imageAttachments };
 }
 
-function rebuildSlackPrompt(ctx: SlackContext, workspacePath: string, rawText: string): string {
+function rebuildSlackPrompt(
+	ctx: SlackContext,
+	workspacePath: string,
+	rawText: string,
+	threadRootMessage?: ThreadRootMessage,
+): string {
 	const nextContext: SlackContext = {
 		...ctx,
 		message: {
@@ -1445,7 +1475,7 @@ function rebuildSlackPrompt(ctx: SlackContext, workspacePath: string, rawText: s
 			rawText: rawText,
 		},
 	};
-	return buildPromptInput(nextContext, workspacePath).promptText;
+	return buildPromptInput(nextContext, workspacePath, threadRootMessage).promptText;
 }
 
 function buildSlackTimestamp(): string {

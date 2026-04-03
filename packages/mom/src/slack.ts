@@ -2,7 +2,7 @@ import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "fs";
 import { basename, join } from "path";
-import { type ConversationScope, resolveConversationScope } from "./conversation-scope.js";
+import { type ConversationScope, resolveConversationScope, resolveExecutionChannelId } from "./conversation-scope.js";
 import * as log from "./log.js";
 import type { Attachment, ChannelStore, LoggedMessage } from "./store.js";
 
@@ -72,9 +72,9 @@ export interface SlackContext {
 
 export interface MomHandler {
 	/**
-	 * Check if a conversation is currently running (SYNC)
+	 * Check if a channel is currently executing work (SYNC)
 	 */
-	isRunning(conversationKey: string): boolean;
+	isRunning(channelId: string): boolean;
 
 	/**
 	 * Handle an event that triggers mom (ASYNC)
@@ -91,12 +91,23 @@ export interface MomHandler {
 }
 
 // ============================================================================
-// Per-conversation queue for sequential processing
+// Per-channel queue for sequential processing against shared channel workspace state
 // ============================================================================
+
+export function resolveLoggedThreadRootTs(
+	channelId: string,
+	messageTs: string,
+	threadRootTs?: string,
+): string | undefined {
+	if (channelId.startsWith("D")) {
+		return undefined;
+	}
+	return threadRootTs ?? messageTs;
+}
 
 type QueuedWork = () => Promise<void>;
 
-class ConversationQueue {
+class ChannelQueue {
 	private queue: QueuedWork[] = [];
 	private processing = false;
 
@@ -138,7 +149,7 @@ export class SlackBot {
 
 	private users = new Map<string, SlackUser>();
 	private channels = new Map<string, SlackChannel>();
-	private queues = new Map<string, ConversationQueue>();
+	private queues = new Map<string, ChannelQueue>();
 
 	constructor(
 		handler: MomHandler,
@@ -246,7 +257,7 @@ export class SlackBot {
 			text,
 			attachments: [],
 			isBot: true,
-			threadRootTs,
+			threadRootTs: resolveLoggedThreadRootTs(channel, ts, threadRootTs),
 		});
 	}
 
@@ -260,12 +271,13 @@ export class SlackBot {
 	 */
 	enqueueEvent(event: SlackEvent): boolean {
 		const scope = resolveConversationScope(event, { isEvent: true });
-		const queue = this.getQueue(scope.key);
+		const executionChannelId = resolveExecutionChannelId(scope);
+		const queue = this.getQueue(executionChannelId);
 		if (queue.size() >= 5) {
-			log.logWarning(`Event queue full for ${scope.key}, discarding: ${event.text.substring(0, 50)}`);
+			log.logWarning(`Event queue full for ${executionChannelId}, discarding: ${event.text.substring(0, 50)}`);
 			return false;
 		}
-		log.logInfo(`Enqueueing event for ${scope.key}: ${event.text.substring(0, 50)}`);
+		log.logInfo(`Enqueueing event for ${executionChannelId}: ${event.text.substring(0, 50)}`);
 		queue.enqueue(() => this.handler.handleEvent(event, scope, this, true));
 		return true;
 	}
@@ -274,11 +286,11 @@ export class SlackBot {
 	// Private - Event Handlers
 	// ==========================================================================
 
-	private getQueue(conversationKey: string): ConversationQueue {
-		let queue = this.queues.get(conversationKey);
+	private getQueue(channelId: string): ChannelQueue {
+		let queue = this.queues.get(channelId);
 		if (!queue) {
-			queue = new ConversationQueue();
-			this.queues.set(conversationKey, queue);
+			queue = new ChannelQueue();
+			this.queues.set(channelId, queue);
 		}
 		return queue;
 	}
@@ -311,6 +323,7 @@ export class SlackBot {
 				files: e.files,
 			};
 			const scope = resolveConversationScope(slackEvent);
+			const executionChannelId = resolveExecutionChannelId(scope);
 
 			// SYNC: Log to log.jsonl (ALWAYS, even for old messages)
 			// Also downloads attachments in background and stores local paths
@@ -327,8 +340,10 @@ export class SlackBot {
 
 			// Check for stop command - execute immediately, don't queue!
 			if (slackEvent.text.toLowerCase().trim() === "stop") {
-				if (this.handler.isRunning(scope.key)) {
-					void this.handler.handleStop(slackEvent, scope, this); // Don't await, don't queue
+				if (this.handler.isRunning(executionChannelId)) {
+					void this.handler.handleStop(slackEvent, scope, this).catch((error) => {
+						log.logWarning("Stop handler error", error instanceof Error ? error.message : String(error));
+					}); // Don't await, don't queue
 				} else {
 					void this.postConversationMessage(e.channel, scope.threadRootTs, "_Nothing running_");
 				}
@@ -337,14 +352,14 @@ export class SlackBot {
 			}
 
 			// SYNC: Check if busy
-			if (this.handler.isRunning(scope.key)) {
+			if (this.handler.isRunning(executionChannelId)) {
 				void this.postConversationMessage(
 					e.channel,
 					scope.threadRootTs,
 					"_Already working. Say `@mom stop` to cancel._",
 				);
 			} else {
-				this.getQueue(scope.key).enqueue(() => this.handler.handleEvent(slackEvent, scope, this));
+				this.getQueue(executionChannelId).enqueue(() => this.handler.handleEvent(slackEvent, scope, this));
 			}
 
 			ack();
@@ -397,6 +412,7 @@ export class SlackBot {
 				files: e.files,
 			};
 			const scope = resolveConversationScope(slackEvent);
+			const executionChannelId = resolveExecutionChannelId(scope);
 
 			// SYNC: Log to log.jsonl (ALL messages - channel chatter and DMs)
 			// Also downloads attachments in background and stores local paths
@@ -413,8 +429,10 @@ export class SlackBot {
 			if (isDM) {
 				// Check for stop command - execute immediately, don't queue!
 				if (slackEvent.text.toLowerCase().trim() === "stop") {
-					if (this.handler.isRunning(scope.key)) {
-						void this.handler.handleStop(slackEvent, scope, this); // Don't await, don't queue
+					if (this.handler.isRunning(executionChannelId)) {
+						void this.handler.handleStop(slackEvent, scope, this).catch((error) => {
+							log.logWarning("Stop handler error", error instanceof Error ? error.message : String(error));
+						}); // Don't await, don't queue
 					} else {
 						void this.postConversationMessage(e.channel, scope.threadRootTs, "_Nothing running_");
 					}
@@ -429,7 +447,7 @@ export class SlackBot {
 						"_Already working. Say `stop` to cancel._",
 					);
 				} else {
-					this.getQueue(scope.key).enqueue(() => this.handler.handleEvent(slackEvent, scope, this));
+					this.getQueue(executionChannelId).enqueue(() => this.handler.handleEvent(slackEvent, scope, this));
 				}
 			}
 
@@ -454,7 +472,7 @@ export class SlackBot {
 			text: event.text,
 			attachments,
 			isBot: false,
-			threadRootTs: scope.threadRootTs,
+			threadRootTs: resolveLoggedThreadRootTs(event.channel, event.ts, scope.threadRootTs),
 		});
 		return attachments;
 	}
@@ -536,7 +554,7 @@ export class SlackBot {
 		for (const msg of relevantMessages) {
 			const isMomMessage = msg.user === this.botUserId;
 			const user = this.users.get(msg.user!);
-			const threadRootTs = channelId.startsWith("D") ? undefined : (msg.thread_ts ?? msg.ts);
+			const threadRootTs = resolveLoggedThreadRootTs(channelId, msg.ts!, msg.thread_ts);
 			// Strip @mentions from text (same as live messages)
 			const text = (msg.text || "").replace(/<@[A-Z0-9]+>/gi, "").trim();
 			// Process attachments - queues downloads in background

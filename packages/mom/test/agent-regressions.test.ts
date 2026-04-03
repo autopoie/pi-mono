@@ -2,7 +2,7 @@ import type { AssistantMessage, ToolResultMessage, Usage } from "@mariozechner/p
 import type { SessionEntry, SessionMessageEntry } from "@mariozechner/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 
-import { buildHistoryAccessPromptSection } from "../src/agent.js";
+import { buildHistoryAccessPromptSection, buildPromptInput } from "../src/agent.js";
 import {
 	enqueueAssistantProgressMessages,
 	refreshSessionBaseSystemPrompt,
@@ -10,7 +10,9 @@ import {
 	scrubPersistedResponsesReplayMetadata,
 	shortCircuitHandledPreflight,
 } from "../src/agent-internals.js";
+import type { ThreadRootMessage } from "../src/context.js";
 import { resolveConversationScope } from "../src/conversation-scope.js";
+import type { SlackContext } from "../src/slack.js";
 import {
 	MAIN_OVERFLOW_NOTE,
 	MAX_MAIN_MESSAGE_LENGTH,
@@ -109,6 +111,46 @@ describe("mom agent regressions", () => {
 		expect(promptSection).toContain("Do not inspect `/workspace/C123/log.jsonl` unless the user explicitly asks");
 		expect(promptSection).toContain("Do not use the read tool on whole history files");
 		expect(promptSection).not.toContain("tail -30 /workspace/C123/log.jsonl");
+	});
+
+	it("includes explicit root-thread message context in follow-up prompts", () => {
+		const threadRootMessage: ThreadRootMessage = {
+			ts: "1000.1",
+			user: "bot",
+			text: "EVENTROOT_1775235747",
+			isBot: true,
+		};
+		const ctx: SlackContext = {
+			message: {
+				text: "what exact token was in the root message above? Reply with just the token.",
+				rawText: "what exact token was in the root message above? Reply with just the token.",
+				user: "U1",
+				userName: "milo",
+				channel: "C123",
+				ts: "1001.1",
+				threadTs: "1000.1",
+				attachments: [],
+			},
+			channels: [],
+			users: [],
+			respond: async () => {},
+			publishFinal: async () => {},
+			replaceMessage: async () => {},
+			respondInThread: async () => {},
+			setTyping: async () => {},
+			uploadFile: async () => {},
+			setWorking: async () => {},
+			deleteMessage: async () => {},
+		};
+
+		const { promptText } = buildPromptInput(ctx, "/workspace", threadRootMessage);
+
+		expect(promptText).toContain("<slack_thread_root_message>");
+		expect(promptText).toContain("When the user refers to the root message above, they mean this message.");
+		expect(promptText).toContain("[bot]: EVENTROOT_1775235747");
+		expect(promptText).toContain(
+			"[milo]: what exact token was in the root message above? Reply with just the token.",
+		);
 	});
 
 	it("falls back to filtered channel-log guidance when the scoped history file is unavailable", () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { resolveConversationScope } from "../src/conversation-scope.js";
+import { resolveConversationScope, resolveExecutionChannelId } from "../src/conversation-scope.js";
 
 describe("mom conversation scope", () => {
 	it("uses one key per mention thread in the same channel", () => {
@@ -63,7 +63,19 @@ describe("mom conversation scope", () => {
 		});
 	});
 
-	it("keeps synthetic events channel-scoped", () => {
+	it("separates per-thread session identity from per-channel execution identity", () => {
+		const firstThread = resolveConversationScope({
+			type: "mention",
+			channel: "C123",
+			ts: "1000.1",
+			threadTs: "1000.1",
+		});
+		const secondThread = resolveConversationScope({
+			type: "mention",
+			channel: "C123",
+			ts: "2000.1",
+			threadTs: "2000.1",
+		});
 		const eventScope = resolveConversationScope(
 			{
 				type: "mention",
@@ -74,6 +86,9 @@ describe("mom conversation scope", () => {
 			{ isEvent: true },
 		);
 
+		expect(resolveExecutionChannelId(firstThread)).toBe("C123");
+		expect(resolveExecutionChannelId(secondThread)).toBe("C123");
+		expect(resolveExecutionChannelId(eventScope)).toBe("C123");
 		expect(eventScope).toEqual({
 			kind: "channel",
 			key: "C123",

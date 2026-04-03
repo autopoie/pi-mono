@@ -133,7 +133,8 @@ export ANTHROPIC_API_KEY=sk-ant-...
 Workspace settings live at `<workspace>/.pi/settings.json`.
 - `MOM_MODEL=provider:model` selects the startup model without changing workspace defaults
 - `mom` resolves provider credentials from the selected model
-- channel mention replies stay in the triggering Slack thread, and each mention thread keeps its own persisted session context
+- channel mention replies are posted in the triggering Slack thread, with one persisted session context per mention thread
+- mention-thread sessions use isolated session files, and execution is serialized per Slack channel because mutable workspace state is channel-scoped
 - set `MOM_TRUSTED_EXTENSION_ROOT=/absolute/path/outside/workspace` to load extensions only from that trusted root
 - in strict mode, workspace `extensions` and `packages` entries do not affect extension loading
 - without strict mode, `mom` loads extensions from `workspace/.pi/settings.json` `extensions` and `workspace/.pi/extensions`
@@ -144,30 +145,31 @@ See [docs/extensions.md](docs/extensions.md) for extension discovery, trust sett
 
 Mom is a Node.js app that runs on your host machine. She connects to Slack via Socket Mode, receives messages, and responds using an LLM-based agent that can create and use tools.
 
-**For each DM**, mom maintains one channel-scoped conversation history. **For public and private channels**, mom keeps channel assets together but persists a separate conversation session per @mention thread.
+**For each DM**, mom maintains one channel-scoped conversation history. **For public and private channels**, mom stores channel assets together and persists a separate conversation session per @mention thread. Execution is serialized per Slack channel because memory, skills, scratch space, uploads, and other mutable workspace state are channel-scoped.
 
 **When a message arrives in a channel:**
 - The message is written to the channel's `log.jsonl`, retaining full channel history
 - Channel log entries record the normalized Slack thread root, so mom can later replay only the relevant thread into a thread-scoped session
 - If the message has attachments, they are stored in the channel's `attachments/` folder for mom to access
 - For mention threads, mom also derives a scoped `history.jsonl` inside the thread session directory so older-history lookups stay thread-local by default
-- Mom can still search the channel-wide `log.jsonl` when you explicitly ask for broader channel context
+- The channel-wide `log.jsonl` remains available when you explicitly ask for broader channel context
 
 **When you @mention mom (or DM her), she:**
-1. Syncs unseen messages from the channel `log.jsonl` into the active conversation `context.jsonl`. DMs stay channel-scoped; channel mentions sync only the current thread into that thread's persisted session
+1. Syncs unseen messages from the channel `log.jsonl` into the active conversation `context.jsonl`. DMs use channel-scoped conversations; channel mentions sync only the current thread into that thread's persisted session
 2. Loads **memory** from MEMORY.md files (global and channel-specific)
 3. Responds to your request, dynamically using tools to answer it:
    - Read attachments and analyze them
    - Invoke command line tools, e.g. to read your emails
    - Write new files or programs
    - Attach files to her response
-4. Any files or tools mom creates are stored in the channel's directory
+4. Any files or tools mom creates are stored in the channel's directory, and only one run executes at a time per channel because that workspace state is shared across threads
 5. Mom's direct reply is stored in `log.jsonl`, while details like tool call results are kept in the active conversation's `context.jsonl` so she'll "remember" them on later turns in that DM or mention thread
 
 **Context Management:**
 - Mom has limited context depending on the LLM model used. E.g. Claude Opus or Sonnet 4.5 can process a maximum of 200k tokens
 - When the context exceeds the LLM's context window size, mom compacts the context: keeps recent messages and tool results in full, summarizes older ones
 - For older history beyond context, mom uses the conversation-specific history view for the current run: DMs query channel `log.jsonl`, while mention threads default to their derived `history.jsonl`
+- Legacy channel-scoped mention history is not auto-migrated into per-thread sessions. If a thread-specific session does not exist yet, mom starts a fresh isolated thread session and logs that reset in the host process
 
 Everything mom does happens in a workspace you control. This is a single directory that's the only directory she can access on your host machine (when in Docker mode). You can inspect logs, memory, and tools she creates anytime.
 
@@ -227,7 +229,7 @@ You provide mom with a **data directory** (e.g., `./data`) as her workspace. Whi
   │       │   └── last_prompt.jsonl
   │       └── 2000.1/
   │           └── ...
-  └── D456DEF/                      # DM channels stay channel-scoped
+  └── D456DEF/                      # DM channels use channel-scoped sessions
       ├── context.jsonl
       └── ...
 ```
@@ -379,8 +381,9 @@ Mom can schedule events that wake her up at specific times or when external thin
 1. Mom (or a program she writes) creates a JSON file in `data/events/`
 2. The harness detects the file and schedules it
 3. When due, mom receives a message: `[EVENT:filename:type:schedule] text`
-4. Immediate and one-shot events are auto-deleted after triggering
-5. Periodic events persist until explicitly deleted
+4. Events are channel-scoped wakeups: they do not resume the Slack thread that created them, and stop/busy applies across the whole channel while an event is running
+5. Immediate and one-shot events are auto-deleted after triggering
+6. Periodic events persist until explicitly deleted
 
 **Silent completion:** For periodic events that check for activity (inbox, notifications), mom may find nothing to report. She can respond with just `[SILENT]` to delete the status message and post nothing to Slack. This prevents channel spam from periodic checks.
 
