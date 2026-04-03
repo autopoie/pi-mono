@@ -109,11 +109,12 @@ If the agent errors while processing an event:
 
 ## Queue Integration
 
-Events integrate with the existing `ChannelQueue` in `SlackBot`:
+Events integrate with the existing conversation queueing in `SlackBot`:
 
 - New method: `SlackBot.enqueueEvent(event: SlackEvent)` — always queues, no "already working" rejection
-- Maximum 5 events can be queued per channel. If queue is full, discard and log to console.
-- User @mom mentions retain current behavior: rejected with "Already working" message if agent is busy
+- Maximum 5 events can be queued per channel-scoped event conversation. If queue is full, discard and log to console.
+- User DMs are still channel-scoped
+- User @mom mentions are isolated by Slack thread, so "Already working" now only applies within the same mention thread
 
 When an event triggers:
 1. Create a synthetic `SlackEvent` with formatted message
@@ -154,7 +155,7 @@ The filename is used as an identifier for tracking timers and in the event messa
 ### Files
 
 - `src/events.ts` — Event parsing, timer management, fs watching
-- `src/slack.ts` — Add `enqueueEvent()` method and `size()` to `ChannelQueue`
+- `src/slack.ts` — Add `enqueueEvent()` and per-conversation queue sizing for event admission control
 - `src/main.ts` — Initialize events watcher on startup
 - `src/agent.ts` — Update system prompt with events documentation
 

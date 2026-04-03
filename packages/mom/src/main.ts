@@ -2,6 +2,7 @@
 
 import { join, resolve } from "path";
 import { type AgentRunner, createRunner } from "./agent.js";
+import type { ConversationScope } from "./conversation-scope.js";
 import { downloadChannel } from "./download.js";
 import { createEventsWatcher } from "./events.js";
 import { resolveMomTrustConfig, validateStrictTrustBoundary } from "./extensions.js";
@@ -33,13 +34,15 @@ interface ParsedArgs {
 	downloadChannel?: string;
 }
 
-interface ChannelState {
+interface ConversationState {
 	running: boolean;
 	runner?: AgentRunner;
 	store: ChannelStore;
 	stopRequested: boolean;
 	stopMessageTs?: string;
 	channelDir: string;
+	sessionDir: string;
+	conversationKey: string;
 }
 
 function parseArgs(): ParsedArgs {
@@ -106,28 +109,35 @@ if (trustConfig.strict) {
 	log.logInfo(`Strict trusted-extension mode enabled: ${trustConfig.trustedRoot}`);
 }
 
-const channelStates = new Map<string, ChannelState>();
+const conversationStates = new Map<string, ConversationState>();
 
-function getState(channelId: string): ChannelState {
-	let state = channelStates.get(channelId);
+function getState(scope: ConversationScope): ConversationState {
+	let state = conversationStates.get(scope.key);
 	if (!state) {
+		const channelDir = join(workingDir, scope.channelId);
+		const sessionDir = scope.kind === "thread" ? join(channelDir, "sessions", scope.threadRootTs!) : channelDir;
 		state = {
 			running: false,
 			store: new ChannelStore({ workingDir, botToken: MOM_SLACK_BOT_TOKEN! }),
 			stopRequested: false,
-			channelDir: join(workingDir, channelId),
+			channelDir,
+			sessionDir,
+			conversationKey: scope.key,
 		};
-		channelStates.set(channelId, state);
+		conversationStates.set(scope.key, state);
 	}
 	return state;
 }
 
-function ensureRunner(state: ChannelState, channelId: string): AgentRunner {
+function ensureRunner(state: ConversationState, scope: ConversationScope): AgentRunner {
 	if (!state.runner) {
 		state.runner = createRunner({
 			sandboxConfig: sandbox,
-			channelId,
+			channelId: scope.channelId,
+			conversationKey: state.conversationKey,
+			conversationScope: scope,
 			channelDir: state.channelDir,
+			sessionDir: state.sessionDir,
 			workspaceDir: workingDir,
 			trustConfig,
 		});
@@ -135,7 +145,12 @@ function ensureRunner(state: ChannelState, channelId: string): AgentRunner {
 	return state.runner;
 }
 
-function createSlackContext(event: SlackEvent, slack: SlackBot, isEvent = false): SlackContext {
+function createSlackContext(
+	event: SlackEvent,
+	scope: ConversationScope,
+	slack: SlackBot,
+	isEvent = false,
+): SlackContext {
 	let messageTs: string | null = null;
 	const threadMessageTs: string[] = [];
 	let accumulatedText = "";
@@ -145,14 +160,11 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, isEvent = false)
 
 	const workingIndicator = " ...";
 	const user = slack.getUser(event.user);
-	const channelMentionThreadRootTs = !isEvent && event.type === "mention" ? (event.threadTs ?? event.ts) : undefined;
+	const conversationThreadRootTs = scope.threadRootTs;
 	const eventFilename = isEvent ? event.text.match(/^\[EVENT:([^:]+):/)?.[1] : undefined;
 
 	const postPrimaryMessage = async (text: string): Promise<string> => {
-		if (channelMentionThreadRootTs) {
-			return slack.postInThread(event.channel, channelMentionThreadRootTs, text);
-		}
-		return slack.postMessage(event.channel, text);
+		return slack.postConversationMessage(event.channel, conversationThreadRootTs, text);
 	};
 
 	const updatePrimaryMessage = async (text: string): Promise<void> => {
@@ -172,7 +184,7 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, isEvent = false)
 					: truncateSlackText(accumulatedText, MAX_MAIN_MESSAGE_LENGTH, TRUNCATION_NOTE);
 				await updatePrimaryMessage(displayText);
 				if (shouldLog && messageTs) {
-					slack.logBotResponse(event.channel, text, messageTs);
+					slack.logBotResponse(event.channel, text, messageTs, conversationThreadRootTs);
 				}
 			} catch (error) {
 				log.logWarning("Slack respond error", error instanceof Error ? error.message : String(error));
@@ -193,14 +205,14 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, isEvent = false)
 					postInThread: async (overflowPart) => {
 						const ts = await slack.postInThread(
 							event.channel,
-							channelMentionThreadRootTs ?? messageTs!,
+							conversationThreadRootTs ?? messageTs!,
 							overflowPart,
 						);
 						threadMessageTs.push(ts);
 					},
 				});
 				if (shouldLog && !finalMessageLogged && messageTs) {
-					slack.logBotResponse(event.channel, mainText, messageTs);
+					slack.logBotResponse(event.channel, mainText, messageTs, conversationThreadRootTs);
 					finalMessageLogged = true;
 				}
 			} catch (error) {
@@ -213,7 +225,7 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, isEvent = false)
 	const respondInThread: SlackContext["respondInThread"] = async (text) => {
 		updatePromise = updatePromise.then(async () => {
 			try {
-				const threadRootTs = channelMentionThreadRootTs ?? messageTs;
+				const threadRootTs = conversationThreadRootTs ?? messageTs;
 				if (!threadRootTs) {
 					return;
 				}
@@ -236,7 +248,7 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, isEvent = false)
 			userName: user?.userName,
 			channel: event.channel,
 			ts: event.ts,
-			threadTs: channelMentionThreadRootTs ?? event.threadTs,
+			threadTs: conversationThreadRootTs ?? event.threadTs,
 			attachments: (event.attachments || []).map((attachment) => ({ local: attachment.local })),
 		},
 		channelName: slack.getChannel(event.channel)?.name,
@@ -306,33 +318,33 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, isEvent = false)
 }
 
 const handler: MomHandler = {
-	isRunning(channelId: string): boolean {
-		const state = channelStates.get(channelId);
+	isRunning(conversationKey: string): boolean {
+		const state = conversationStates.get(conversationKey);
 		return state?.running ?? false;
 	},
 
-	async handleStop(channelId: string, slack: SlackBot): Promise<void> {
-		const state = channelStates.get(channelId);
+	async handleStop(event: SlackEvent, scope: ConversationScope, slack: SlackBot): Promise<void> {
+		const state = conversationStates.get(scope.key);
 		if (state?.running && state.runner) {
 			state.stopRequested = true;
 			state.runner.abort();
-			state.stopMessageTs = await slack.postMessage(channelId, "_Stopping..._");
+			state.stopMessageTs = await slack.postConversationMessage(event.channel, scope.threadRootTs, "_Stopping..._");
 			return;
 		}
 
-		await slack.postMessage(channelId, "_Nothing running_");
+		await slack.postConversationMessage(event.channel, scope.threadRootTs, "_Nothing running_");
 	},
 
-	async handleEvent(event: SlackEvent, slack: SlackBot, isEvent = false): Promise<void> {
-		const state = getState(event.channel);
-		const runner = ensureRunner(state, event.channel);
+	async handleEvent(event: SlackEvent, scope: ConversationScope, slack: SlackBot, isEvent = false): Promise<void> {
+		const state = getState(scope);
+		const runner = ensureRunner(state, scope);
 		state.running = true;
 		state.stopRequested = false;
 
-		log.logInfo(`[${event.channel}] Starting run: ${event.text.substring(0, 50)}`);
+		log.logInfo(`[${scope.key}] Starting run: ${event.text.substring(0, 50)}`);
 
 		try {
-			const ctx = createSlackContext(event, slack, isEvent);
+			const ctx = createSlackContext(event, scope, slack, isEvent);
 			const result = await runner.run(ctx, state.store);
 			await ctx.setWorking(false);
 
@@ -345,11 +357,11 @@ const handler: MomHandler = {
 					await slack.updateMessage(event.channel, state.stopMessageTs, "_Stopped_");
 					state.stopMessageTs = undefined;
 				} else {
-					await slack.postMessage(event.channel, "_Stopped_");
+					await slack.postConversationMessage(event.channel, scope.threadRootTs, "_Stopped_");
 				}
 			}
 		} catch (error) {
-			log.logWarning(`[${event.channel}] Run error`, error instanceof Error ? error.message : String(error));
+			log.logWarning(`[${scope.key}] Run error`, error instanceof Error ? error.message : String(error));
 		} finally {
 			state.running = false;
 		}

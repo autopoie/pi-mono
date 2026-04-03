@@ -2,8 +2,9 @@ import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "fs";
 import { basename, join } from "path";
+import { type ConversationScope, resolveConversationScope } from "./conversation-scope.js";
 import * as log from "./log.js";
-import type { Attachment, ChannelStore } from "./store.js";
+import type { Attachment, ChannelStore, LoggedMessage } from "./store.js";
 
 // ============================================================================
 // Types
@@ -71,31 +72,31 @@ export interface SlackContext {
 
 export interface MomHandler {
 	/**
-	 * Check if channel is currently running (SYNC)
+	 * Check if a conversation is currently running (SYNC)
 	 */
-	isRunning(channelId: string): boolean;
+	isRunning(conversationKey: string): boolean;
 
 	/**
 	 * Handle an event that triggers mom (ASYNC)
 	 * Called only when isRunning() returned false for user messages.
 	 * Events always queue and pass isEvent=true.
 	 */
-	handleEvent(event: SlackEvent, slack: SlackBot, isEvent?: boolean): Promise<void>;
+	handleEvent(event: SlackEvent, scope: ConversationScope, slack: SlackBot, isEvent?: boolean): Promise<void>;
 
 	/**
 	 * Handle stop command (ASYNC)
 	 * Called when user says "stop" while mom is running
 	 */
-	handleStop(channelId: string, slack: SlackBot): Promise<void>;
+	handleStop(event: SlackEvent, scope: ConversationScope, slack: SlackBot): Promise<void>;
 }
 
 // ============================================================================
-// Per-channel queue for sequential processing
+// Per-conversation queue for sequential processing
 // ============================================================================
 
 type QueuedWork = () => Promise<void>;
 
-class ChannelQueue {
+class ConversationQueue {
 	private queue: QueuedWork[] = [];
 	private processing = false;
 
@@ -137,7 +138,7 @@ export class SlackBot {
 
 	private users = new Map<string, SlackUser>();
 	private channels = new Map<string, SlackChannel>();
-	private queues = new Map<string, ChannelQueue>();
+	private queues = new Map<string, ConversationQueue>();
 
 	constructor(
 		handler: MomHandler,
@@ -206,6 +207,13 @@ export class SlackBot {
 		return result.ts as string;
 	}
 
+	async postConversationMessage(channel: string, threadRootTs: string | undefined, text: string): Promise<string> {
+		if (threadRootTs) {
+			return this.postInThread(channel, threadRootTs, text);
+		}
+		return this.postMessage(channel, text);
+	}
+
 	async uploadFile(channel: string, filePath: string, title?: string): Promise<void> {
 		const fileName = title || basename(filePath);
 		const fileContent = readFileSync(filePath);
@@ -221,7 +229,7 @@ export class SlackBot {
 	 * Log a message to log.jsonl (SYNC)
 	 * This is the ONLY place messages are written to log.jsonl
 	 */
-	logToFile(channel: string, entry: object): void {
+	logToFile(channel: string, entry: LoggedMessage): void {
 		const dir = join(this.workingDir, channel);
 		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 		appendFileSync(join(dir, "log.jsonl"), `${JSON.stringify(entry)}\n`);
@@ -230,7 +238,7 @@ export class SlackBot {
 	/**
 	 * Log a bot response to log.jsonl
 	 */
-	logBotResponse(channel: string, text: string, ts: string): void {
+	logBotResponse(channel: string, text: string, ts: string, threadRootTs?: string): void {
 		this.logToFile(channel, {
 			date: new Date().toISOString(),
 			ts,
@@ -238,6 +246,7 @@ export class SlackBot {
 			text,
 			attachments: [],
 			isBot: true,
+			threadRootTs,
 		});
 	}
 
@@ -250,13 +259,14 @@ export class SlackBot {
 	 * Returns true if enqueued, false if queue is full (max 5).
 	 */
 	enqueueEvent(event: SlackEvent): boolean {
-		const queue = this.getQueue(event.channel);
+		const scope = resolveConversationScope(event, { isEvent: true });
+		const queue = this.getQueue(scope.key);
 		if (queue.size() >= 5) {
-			log.logWarning(`Event queue full for ${event.channel}, discarding: ${event.text.substring(0, 50)}`);
+			log.logWarning(`Event queue full for ${scope.key}, discarding: ${event.text.substring(0, 50)}`);
 			return false;
 		}
-		log.logInfo(`Enqueueing event for ${event.channel}: ${event.text.substring(0, 50)}`);
-		queue.enqueue(() => this.handler.handleEvent(event, this, true));
+		log.logInfo(`Enqueueing event for ${scope.key}: ${event.text.substring(0, 50)}`);
+		queue.enqueue(() => this.handler.handleEvent(event, scope, this, true));
 		return true;
 	}
 
@@ -264,11 +274,11 @@ export class SlackBot {
 	// Private - Event Handlers
 	// ==========================================================================
 
-	private getQueue(channelId: string): ChannelQueue {
-		let queue = this.queues.get(channelId);
+	private getQueue(conversationKey: string): ConversationQueue {
+		let queue = this.queues.get(conversationKey);
 		if (!queue) {
-			queue = new ChannelQueue();
-			this.queues.set(channelId, queue);
+			queue = new ConversationQueue();
+			this.queues.set(conversationKey, queue);
 		}
 		return queue;
 	}
@@ -300,10 +310,11 @@ export class SlackBot {
 				text: e.text.replace(/<@[A-Z0-9]+>/gi, "").trim(),
 				files: e.files,
 			};
+			const scope = resolveConversationScope(slackEvent);
 
 			// SYNC: Log to log.jsonl (ALWAYS, even for old messages)
 			// Also downloads attachments in background and stores local paths
-			slackEvent.attachments = this.logUserMessage(slackEvent);
+			slackEvent.attachments = this.logUserMessage(slackEvent, scope);
 
 			// Only trigger processing for messages AFTER startup (not replayed old messages)
 			if (this.startupTs && e.ts < this.startupTs) {
@@ -316,20 +327,24 @@ export class SlackBot {
 
 			// Check for stop command - execute immediately, don't queue!
 			if (slackEvent.text.toLowerCase().trim() === "stop") {
-				if (this.handler.isRunning(e.channel)) {
-					this.handler.handleStop(e.channel, this); // Don't await, don't queue
+				if (this.handler.isRunning(scope.key)) {
+					void this.handler.handleStop(slackEvent, scope, this); // Don't await, don't queue
 				} else {
-					this.postMessage(e.channel, "_Nothing running_");
+					void this.postConversationMessage(e.channel, scope.threadRootTs, "_Nothing running_");
 				}
 				ack();
 				return;
 			}
 
 			// SYNC: Check if busy
-			if (this.handler.isRunning(e.channel)) {
-				this.postMessage(e.channel, "_Already working. Say `@mom stop` to cancel._");
+			if (this.handler.isRunning(scope.key)) {
+				void this.postConversationMessage(
+					e.channel,
+					scope.threadRootTs,
+					"_Already working. Say `@mom stop` to cancel._",
+				);
 			} else {
-				this.getQueue(e.channel).enqueue(() => this.handler.handleEvent(slackEvent, this));
+				this.getQueue(scope.key).enqueue(() => this.handler.handleEvent(slackEvent, scope, this));
 			}
 
 			ack();
@@ -381,10 +396,11 @@ export class SlackBot {
 				text: (e.text || "").replace(/<@[A-Z0-9]+>/gi, "").trim(),
 				files: e.files,
 			};
+			const scope = resolveConversationScope(slackEvent);
 
 			// SYNC: Log to log.jsonl (ALL messages - channel chatter and DMs)
 			// Also downloads attachments in background and stores local paths
-			slackEvent.attachments = this.logUserMessage(slackEvent);
+			slackEvent.attachments = this.logUserMessage(slackEvent, scope);
 
 			// Only trigger processing for messages AFTER startup (not replayed old messages)
 			if (this.startupTs && e.ts < this.startupTs) {
@@ -397,19 +413,23 @@ export class SlackBot {
 			if (isDM) {
 				// Check for stop command - execute immediately, don't queue!
 				if (slackEvent.text.toLowerCase().trim() === "stop") {
-					if (this.handler.isRunning(e.channel)) {
-						this.handler.handleStop(e.channel, this); // Don't await, don't queue
+					if (this.handler.isRunning(scope.key)) {
+						void this.handler.handleStop(slackEvent, scope, this); // Don't await, don't queue
 					} else {
-						this.postMessage(e.channel, "_Nothing running_");
+						void this.postConversationMessage(e.channel, scope.threadRootTs, "_Nothing running_");
 					}
 					ack();
 					return;
 				}
 
-				if (this.handler.isRunning(e.channel)) {
-					this.postMessage(e.channel, "_Already working. Say `stop` to cancel._");
+				if (this.handler.isRunning(scope.key)) {
+					void this.postConversationMessage(
+						e.channel,
+						scope.threadRootTs,
+						"_Already working. Say `stop` to cancel._",
+					);
 				} else {
-					this.getQueue(e.channel).enqueue(() => this.handler.handleEvent(slackEvent, this));
+					this.getQueue(scope.key).enqueue(() => this.handler.handleEvent(slackEvent, scope, this));
 				}
 			}
 
@@ -421,7 +441,7 @@ export class SlackBot {
 	 * Log a user message to log.jsonl (SYNC)
 	 * Downloads attachments in background via store
 	 */
-	private logUserMessage(event: SlackEvent): Attachment[] {
+	private logUserMessage(event: SlackEvent, scope: ConversationScope): Attachment[] {
 		const user = this.users.get(event.user);
 		// Process attachments - queues downloads in background
 		const attachments = event.files ? this.store.processAttachments(event.channel, event.files, event.ts) : [];
@@ -434,6 +454,7 @@ export class SlackBot {
 			text: event.text,
 			attachments,
 			isBot: false,
+			threadRootTs: scope.threadRootTs,
 		});
 		return attachments;
 	}
@@ -472,6 +493,7 @@ export class SlackBot {
 			bot_id?: string;
 			text?: string;
 			ts?: string;
+			thread_ts?: string;
 			subtype?: string;
 			files?: Array<{ name: string }>;
 		};
@@ -514,6 +536,7 @@ export class SlackBot {
 		for (const msg of relevantMessages) {
 			const isMomMessage = msg.user === this.botUserId;
 			const user = this.users.get(msg.user!);
+			const threadRootTs = channelId.startsWith("D") ? undefined : (msg.thread_ts ?? msg.ts);
 			// Strip @mentions from text (same as live messages)
 			const text = (msg.text || "").replace(/<@[A-Z0-9]+>/gi, "").trim();
 			// Process attachments - queues downloads in background
@@ -528,6 +551,7 @@ export class SlackBot {
 				text,
 				attachments,
 				isBot: isMomMessage,
+				threadRootTs,
 			});
 		}
 

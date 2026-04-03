@@ -24,7 +24,13 @@ import {
 	scrubPersistedResponsesReplayMetadata,
 	shortCircuitHandledPreflight,
 } from "./agent-internals.js";
-import { createMomSettingsManager, syncLogToSessionManager } from "./context.js";
+import {
+	createMomSettingsManager,
+	type HistoryAccessTarget,
+	prepareHistoryAccessTarget,
+	syncLogToSessionManager,
+} from "./context.js";
+import type { ConversationScope } from "./conversation-scope.js";
 import {
 	createMomDisplayState,
 	type MomDisplayState,
@@ -78,7 +84,10 @@ export interface AgentRunner {
 interface CreateRunnerOptions {
 	sandboxConfig: SandboxConfig;
 	channelId: string;
+	conversationKey: string;
+	conversationScope: ConversationScope;
 	channelDir: string;
+	sessionDir: string;
 	workspaceDir: string;
 	trustConfig: MomTrustConfig;
 }
@@ -106,6 +115,14 @@ interface PendingToolState {
 	toolName: string;
 	args: unknown;
 	startTime: number;
+}
+
+interface HistoryAccessPromptInput {
+	conversationScope: ConversationScope;
+	channelPath: string;
+	sessionPath: string;
+	historyAccess: HistoryAccessTarget;
+	isDocker: boolean;
 }
 
 interface UsageTotals {
@@ -144,7 +161,10 @@ interface RunState {
 export function createRunner({
 	sandboxConfig,
 	channelId,
+	conversationKey,
+	conversationScope,
 	channelDir,
+	sessionDir,
 	workspaceDir,
 	trustConfig,
 }: CreateRunnerOptions): AgentRunner {
@@ -190,7 +210,10 @@ export function createRunner({
 		initializationPromise = initializeRunner({
 			sandboxConfig,
 			channelId,
+			conversationKey,
+			conversationScope,
 			channelDir,
+			sessionDir,
 			workspaceDir,
 			trustConfig,
 			runState,
@@ -224,7 +247,10 @@ export function createRunner({
 			const result = await runInitializedRunner({
 				ctx,
 				channelId,
+				conversationKey,
+				conversationScope,
 				channelDir,
+				sessionDir,
 				sandboxConfig,
 				state,
 				runState,
@@ -251,7 +277,10 @@ export function createRunner({
 async function initializeRunner({
 	sandboxConfig,
 	channelId,
+	conversationKey,
+	conversationScope,
 	channelDir,
+	sessionDir,
 	workspaceDir,
 	trustConfig,
 	runState,
@@ -259,7 +288,10 @@ async function initializeRunner({
 }: {
 	sandboxConfig: SandboxConfig;
 	channelId: string;
+	conversationKey: string;
+	conversationScope: ConversationScope;
 	channelDir: string;
+	sessionDir: string;
 	workspaceDir: string;
 	trustConfig: MomTrustConfig;
 	runState: RunState;
@@ -270,15 +302,28 @@ async function initializeRunner({
 	const tools = createMomTools(executor);
 	const memory = getMemory(workspaceDir, channelDir);
 	const skills = loadMomSkills(channelDir, workspaceDir, workspacePath);
-	const initialSystemPrompt = buildSystemPrompt(workspacePath, channelId, memory, sandboxConfig, [], [], skills);
-	const contextFile = join(channelDir, "context.jsonl");
-	const sessionManager = SessionManager.open(contextFile, channelDir);
+	const initialSystemPrompt = buildSystemPrompt(
+		workspacePath,
+		channelId,
+		conversationScope,
+		buildPromptHistoryAccessTarget(workspacePath, channelId, conversationScope, {
+			historyFile: join(sessionDir, "history.jsonl"),
+			mode: conversationScope.kind === "thread" ? "thread-history" : "channel-log",
+		}),
+		memory,
+		sandboxConfig,
+		[],
+		[],
+		skills,
+	);
+	const contextFile = join(sessionDir, "context.jsonl");
+	const sessionManager = SessionManager.open(contextFile, sessionDir);
 	// SessionManager.getEntries() returns the live loaded entries via a shallow-copy array,
 	// so scrubbing here updates the in-memory restored history without rewriting context.jsonl
 	const replayMetadataScrubStats = scrubPersistedResponsesReplayMetadata(sessionManager.getEntries());
 	if (replayMetadataScrubStats.assistantMessages > 0) {
 		log.logInfo(
-			`[${channelId}] Scrubbed persisted Responses replay metadata from ${replayMetadataScrubStats.assistantMessages} assistant messages ` +
+			`[${conversationKey}] Scrubbed persisted Responses replay metadata from ${replayMetadataScrubStats.assistantMessages} assistant messages ` +
 				`(${replayMetadataScrubStats.thinkingBlocks} thinking blocks, ${replayMetadataScrubStats.toolCalls} tool calls, ${replayMetadataScrubStats.toolResults} tool results)`,
 		);
 	}
@@ -291,12 +336,12 @@ async function initializeRunner({
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 	const extensionLoadPlan = createExtensionLoadPlan(workspaceDir, trustConfig);
 	for (const warning of extensionLoadPlan.warnings) {
-		log.logWarning(`[${channelId}] Extension loading`, warning);
+		log.logWarning(`[${conversationKey}] Extension loading`, warning);
 	}
 
 	const extensionsResult = await loadMomExtensions(extensionLoadPlan, workspaceDir);
 	for (const { path, error } of extensionsResult.errors) {
-		log.logWarning(`[${channelId}] Failed to load extension`, `${path}: ${error}`);
+		log.logWarning(`[${conversationKey}] Failed to load extension`, `${path}: ${error}`);
 	}
 
 	const systemPromptRef = { current: initialSystemPrompt };
@@ -346,7 +391,7 @@ async function initializeRunner({
 	const loadedSession = sessionManager.buildSessionContext();
 	if (loadedSession.messages.length > 0) {
 		agent.state.messages = loadedSession.messages;
-		log.logInfo(`[${channelId}] Loaded ${loadedSession.messages.length} messages from context.jsonl`);
+		log.logInfo(`[${conversationKey}] Loaded ${loadedSession.messages.length} messages from context.jsonl`);
 	}
 
 	const session = new AgentSession({
@@ -393,7 +438,10 @@ async function initializeRunner({
 async function runInitializedRunner({
 	ctx,
 	channelId,
+	conversationKey,
+	conversationScope,
 	channelDir,
+	sessionDir,
 	sandboxConfig,
 	state,
 	runState,
@@ -402,24 +450,35 @@ async function runInitializedRunner({
 }: {
 	ctx: SlackContext;
 	channelId: string;
+	conversationKey: string;
+	conversationScope: ConversationScope;
 	channelDir: string;
+	sessionDir: string;
 	sandboxConfig: SandboxConfig;
 	state: InitializedRunnerState;
 	runState: RunState;
 	clearThinkingTimer: () => void;
 	armThinkingTimer: (ctx: SlackContext, hideThinkingBlock: boolean) => void;
 }): Promise<AgentRunResult> {
-	await mkdir(channelDir, { recursive: true });
+	await mkdir(sessionDir, { recursive: true });
 
-	const syncedCount = syncLogToSessionManager(state.sessionManager, channelDir, ctx.message.ts);
+	const syncedCount = syncLogToSessionManager(state.sessionManager, channelDir, conversationScope, ctx.message.ts);
 	if (syncedCount > 0) {
-		log.logInfo(`[${channelId}] Synced ${syncedCount} messages from log.jsonl`);
+		log.logInfo(`[${conversationKey}] Synced ${syncedCount} messages from log.jsonl`);
 	}
 
 	const reloadedSession = state.sessionManager.buildSessionContext();
 	if (reloadedSession.messages.length > 0) {
 		state.session.agent.state.messages = reloadedSession.messages;
-		log.logInfo(`[${channelId}] Reloaded ${reloadedSession.messages.length} messages from context`);
+		log.logInfo(`[${conversationKey}] Reloaded ${reloadedSession.messages.length} messages from context`);
+	}
+
+	const historyAccess = prepareHistoryAccessTarget(channelDir, sessionDir, conversationScope);
+	if (historyAccess.mode === "thread-filtered-channel-log") {
+		log.logWarning(
+			`[${conversationKey}] Scoped history view unavailable`,
+			`Falling back to filtered ${join(channelDir, "log.jsonl")}`,
+		);
 	}
 
 	const memory = getMemory(join(channelDir, ".."), channelDir);
@@ -427,6 +486,8 @@ async function runInitializedRunner({
 	state.systemPromptRef.current = buildSystemPrompt(
 		state.workspacePath,
 		channelId,
+		conversationScope,
+		buildPromptHistoryAccessTarget(state.workspacePath, channelId, conversationScope, historyAccess),
 		memory,
 		sandboxConfig,
 		ctx.channels,
@@ -513,7 +574,7 @@ async function runInitializedRunner({
 		newUserMessage: promptText,
 		imageAttachmentCount: imageAttachments.length,
 	};
-	await writeFile(join(channelDir, "last_prompt.jsonl"), JSON.stringify(debugContext, null, 2));
+	await writeFile(join(sessionDir, "last_prompt.jsonl"), JSON.stringify(debugContext, null, 2));
 
 	try {
 		const preflight = await state.extensionBridge.emitRawInput(ctx.message.rawText, imageAttachments, "interactive");
@@ -883,9 +944,145 @@ function loadMomSkills(channelDir: string, workspaceDir: string, workspacePath: 
 	return Array.from(skillMap.values());
 }
 
+function buildSessionPath(workspacePath: string, channelId: string, conversationScope: ConversationScope): string {
+	const channelPath = `${workspacePath}/${channelId}`;
+	return conversationScope.kind === "thread"
+		? `${channelPath}/sessions/${conversationScope.threadRootTs}`
+		: channelPath;
+}
+
+function buildPromptHistoryAccessTarget(
+	workspacePath: string,
+	channelId: string,
+	conversationScope: ConversationScope,
+	historyAccess: HistoryAccessTarget,
+): HistoryAccessTarget {
+	const channelPath = `${workspacePath}/${channelId}`;
+	if (historyAccess.mode === "thread-history") {
+		return {
+			historyFile: `${buildSessionPath(workspacePath, channelId, conversationScope)}/history.jsonl`,
+			mode: historyAccess.mode,
+		};
+	}
+
+	return {
+		historyFile: `${channelPath}/log.jsonl`,
+		mode: historyAccess.mode,
+	};
+}
+
+function buildWorkspaceLayoutSection(
+	workspacePath: string,
+	channelId: string,
+	conversationScope: ConversationScope,
+): string {
+	if (conversationScope.kind !== "thread") {
+		return `${workspacePath}/
+├── .pi/
+│   └── settings.json           # Workspace settings
+├── MEMORY.md                   # Global memory (all channels)
+├── skills/                     # Global CLI tools you create
+└── ${channelId}/               # This conversation's channel
+	├── MEMORY.md               # Channel-specific memory
+	├── log.jsonl               # Full channel history
+	├── context.jsonl           # Persisted LLM context for this conversation
+	├── attachments/            # User-shared files
+	├── scratch/                # Your working directory
+	├── skills/                 # Channel-specific tools
+	└── last_prompt.jsonl       # Debug snapshot for the current run`;
+	}
+
+	return `${workspacePath}/
+├── .pi/
+│   └── settings.json           # Workspace settings
+├── MEMORY.md                   # Global memory (all channels)
+├── skills/                     # Global CLI tools you create
+└── ${channelId}/               # This channel
+	├── MEMORY.md               # Channel-specific memory
+	├── log.jsonl               # Full channel history across all threads
+	├── attachments/            # User-shared files
+	├── scratch/                # Your working directory
+	├── skills/                 # Channel-specific tools
+	└── sessions/${conversationScope.threadRootTs}/
+		├── context.jsonl         # Persisted LLM context for this thread
+		├── history.jsonl         # Scoped older-history view for this thread
+		└── last_prompt.jsonl     # Debug snapshot for the current run`;
+}
+
+export function buildHistoryAccessPromptSection({
+	conversationScope,
+	channelPath,
+	sessionPath,
+	historyAccess,
+	isDocker,
+}: HistoryAccessPromptInput): string {
+	const installJqLine = isDocker ? "Install jq: apk add jq\n" : "";
+
+	if (conversationScope.kind === "thread") {
+		if (historyAccess.mode === "thread-history") {
+			return `## Log Queries (for older history)
+Format: \`{"date":"...","ts":"...","user":"...","userName":"...","text":"...","isBot":false}\`
+The log contains user messages and your final responses (not tool calls/results).
+You are replying in the Slack thread rooted at \`${conversationScope.threadRootTs}\`.
+This thread's session directory is \`${sessionPath}\`.
+Default history file for this conversation: \`${historyAccess.historyFile}\`
+Use \`${historyAccess.historyFile}\` for older history in this conversation. It already contains only this thread's channel history.
+Do not inspect \`${channelPath}/log.jsonl\` unless the user explicitly asks for broader channel-wide or cross-thread history.
+Do not use the read tool on whole history files; raw tool output is visible in Slack. Use bash with tail, grep, and jq to extract only the few lines you need.
+${installJqLine}\`\`\`bash
+# Recent messages in this thread
+tail -30 ${historyAccess.historyFile} | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
+
+# Search this thread for a specific topic
+grep -i "topic" ${historyAccess.historyFile} | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
+
+# Messages from a specific user in this thread
+grep '"userName":"mario"' ${historyAccess.historyFile} | tail -20 | jq -c '{date: .date[0:19], text}'
+\`\`\``;
+		}
+
+		return `## Log Queries (for older history)
+Format: \`{"date":"...","ts":"...","user":"...","userName":"...","text":"...","isBot":false}\`
+The log contains user messages and your final responses (not tool calls/results).
+You are replying in the Slack thread rooted at \`${conversationScope.threadRootTs}\`.
+This thread's session directory is \`${sessionPath}\`.
+The scoped history file for this thread is temporarily unavailable, so if you need older history, query \`${channelPath}/log.jsonl\` with an explicit thread filter.
+Do not inspect \`${channelPath}/log.jsonl\` without filtering to \`threadRootTs == "${conversationScope.threadRootTs}"\` unless the user explicitly asks for broader channel-wide or cross-thread history.
+Do not use the read tool on whole history files; raw tool output is visible in Slack. Use bash with tail, grep, and jq to extract only the few lines you need.
+${installJqLine}\`\`\`bash
+# Recent messages in this thread
+jq -c 'select(.threadRootTs == "${conversationScope.threadRootTs}") | {date: .date[0:19], user: (.userName // .user), text}' ${channelPath}/log.jsonl | tail -30
+
+# Search this thread for a specific topic
+jq -c 'select(.threadRootTs == "${conversationScope.threadRootTs}")' ${channelPath}/log.jsonl | grep -i "topic" | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
+
+# Messages from a specific user in this thread
+jq -c 'select(.threadRootTs == "${conversationScope.threadRootTs}")' ${channelPath}/log.jsonl | grep '"userName":"mario"' | tail -20 | jq -c '{date: .date[0:19], text}'
+\`\`\``;
+	}
+
+	return `## Log Queries (for older history)
+Format: \`{"date":"...","ts":"...","user":"...","userName":"...","text":"...","isBot":false}\`
+The log contains user messages and your final responses (not tool calls/results).
+Default history file for this conversation: \`${historyAccess.historyFile}\`
+Do not use the read tool on whole history files; raw tool output is visible in Slack. Use bash with tail, grep, and jq to extract only the few lines you need.
+${installJqLine}\`\`\`bash
+# Recent messages
+tail -30 ${historyAccess.historyFile} | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
+
+# Search for specific topic
+grep -i "topic" ${historyAccess.historyFile} | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
+
+# Messages from specific user
+grep '"userName":"mario"' ${historyAccess.historyFile} | tail -20 | jq -c '{date: .date[0:19], text}'
+\`\`\``;
+}
+
 function buildSystemPrompt(
 	workspacePath: string,
 	channelId: string,
+	conversationScope: ConversationScope,
+	historyAccess: HistoryAccessTarget,
 	memory: string,
 	sandboxConfig: SandboxConfig,
 	channels: ChannelInfo[],
@@ -893,6 +1090,7 @@ function buildSystemPrompt(
 	skills: Skill[],
 ): string {
 	const channelPath = `${workspacePath}/${channelId}`;
+	const sessionPath = buildSessionPath(workspacePath, channelId, conversationScope);
 	const isDocker = sandboxConfig.type === "docker";
 	const channelMappings =
 		channels.length > 0
@@ -911,7 +1109,7 @@ function buildSystemPrompt(
 ## Context
 - For current date/time, use: date
 - You have access to previous conversation context including tool results from prior turns.
-- For older history beyond your context, search log.jsonl (contains user messages and your final responses, but not tool results).
+- For older history beyond your context, use the conversation-specific history guidance in the Log Queries section below.
 
 ## Slack Formatting (mrkdwn, NOT Markdown)
 Bold: *text*, Italic: _text_, Code: \`code\`, Block: \`\`\`code\`\`\`, Links: <url|text>
@@ -928,17 +1126,7 @@ When mentioning users, use <@username> format (e.g., <@mario>).
 ${envDescription}
 
 ## Workspace Layout
-${workspacePath}/
-├── .pi/
-│   └── settings.json           # Workspace settings
-├── MEMORY.md                   # Global memory (all channels)
-├── skills/                     # Global CLI tools you create
-└── ${channelId}/               # This channel
-	├── MEMORY.md               # Channel-specific memory
-	├── log.jsonl               # Message history (no tool results)
-	├── attachments/            # User-shared files
-	├── scratch/                # Your working directory
-	└── skills/                 # Channel-specific tools
+${buildWorkspaceLayoutSection(workspacePath, channelId, conversationScope)}
 
 ## Skills (Custom CLI Tools)
 You can create reusable CLI tools for recurring tasks (email, APIs, data processing, etc.).
@@ -1042,21 +1230,13 @@ Maintain ${workspacePath}/SYSTEM.md to log all environment modifications:
 
 Update this file whenever you modify the environment. On fresh container, read it first to restore your setup.
 
-## Log Queries (for older history)
-Format: \`{"date":"...","ts":"...","user":"...","userName":"...","text":"...","isBot":false}\`
-The log contains user messages and your final responses (not tool calls/results).
-${isDocker ? "Install jq: apk add jq" : ""}
-
-\`\`\`bash
-# Recent messages
-tail -30 log.jsonl | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
-
-# Search for specific topic
-grep -i "topic" log.jsonl | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
-
-# Messages from specific user
-grep '"userName":"mario"' log.jsonl | tail -20 | jq -c '{date: .date[0:19], text}'
-\`\`\`
+${buildHistoryAccessPromptSection({
+	conversationScope,
+	channelPath,
+	sessionPath,
+	historyAccess,
+	isDocker,
+})}
 
 ## Tools
 - bash: Run shell commands (primary tool). Install packages as needed.

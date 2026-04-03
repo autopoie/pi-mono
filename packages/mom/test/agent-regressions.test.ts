@@ -2,6 +2,7 @@ import type { AssistantMessage, ToolResultMessage, Usage } from "@mariozechner/p
 import type { SessionEntry, SessionMessageEntry } from "@mariozechner/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 
+import { buildHistoryAccessPromptSection } from "../src/agent.js";
 import {
 	enqueueAssistantProgressMessages,
 	refreshSessionBaseSystemPrompt,
@@ -9,6 +10,7 @@ import {
 	scrubPersistedResponsesReplayMetadata,
 	shortCircuitHandledPreflight,
 } from "../src/agent-internals.js";
+import { resolveConversationScope } from "../src/conversation-scope.js";
 import {
 	MAIN_OVERFLOW_NOTE,
 	MAX_MAIN_MESSAGE_LENGTH,
@@ -83,6 +85,52 @@ describe("mom agent regressions", () => {
 			errorMessage: "Unsupported @mariozechner/pi-coding-agent AgentSession shape for mom system-prompt refresh",
 			fatalInitializationError: true,
 		});
+	});
+
+	it("uses a scoped history file and thread-specific guidance for mention-thread older history", () => {
+		const promptSection = buildHistoryAccessPromptSection({
+			conversationScope: resolveConversationScope({
+				type: "mention",
+				channel: "C123",
+				ts: "1000.1",
+				threadTs: "1000.1",
+			}),
+			channelPath: "/workspace/C123",
+			sessionPath: "/workspace/C123/sessions/1000.1",
+			historyAccess: {
+				historyFile: "/workspace/C123/sessions/1000.1/history.jsonl",
+				mode: "thread-history",
+			},
+			isDocker: true,
+		});
+
+		expect(promptSection).toContain("Slack thread rooted at `1000.1`");
+		expect(promptSection).toContain("/workspace/C123/sessions/1000.1/history.jsonl");
+		expect(promptSection).toContain("Do not inspect `/workspace/C123/log.jsonl` unless the user explicitly asks");
+		expect(promptSection).toContain("Do not use the read tool on whole history files");
+		expect(promptSection).not.toContain("tail -30 /workspace/C123/log.jsonl");
+	});
+
+	it("falls back to filtered channel-log guidance when the scoped history file is unavailable", () => {
+		const promptSection = buildHistoryAccessPromptSection({
+			conversationScope: resolveConversationScope({
+				type: "mention",
+				channel: "C123",
+				ts: "1000.1",
+				threadTs: "1000.1",
+			}),
+			channelPath: "/workspace/C123",
+			sessionPath: "/workspace/C123/sessions/1000.1",
+			historyAccess: {
+				historyFile: "/workspace/C123/log.jsonl",
+				mode: "thread-filtered-channel-log",
+			},
+			isDocker: false,
+		});
+
+		expect(promptSection).toContain("query `/workspace/C123/log.jsonl` with an explicit thread filter");
+		expect(promptSection).toContain('select(.threadRootTs == "1000.1")');
+		expect(promptSection).not.toContain("history.jsonl");
 	});
 
 	it("scrubs persisted Responses replay metadata while preserving durable assistant metadata", () => {

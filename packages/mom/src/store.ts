@@ -17,6 +17,7 @@ export interface LoggedMessage {
 	text: string;
 	attachments: Attachment[];
 	isBot: boolean;
+	threadRootTs?: string; // normalized Slack thread root for channel-thread messages
 }
 
 export interface ChannelStoreConfig {
@@ -147,7 +148,7 @@ export class ChannelStore {
 	/**
 	 * Log a bot response
 	 */
-	async logBotResponse(channelId: string, text: string, ts: string): Promise<void> {
+	async logBotResponse(channelId: string, text: string, ts: string, threadRootTs?: string): Promise<void> {
 		await this.logMessage(channelId, {
 			date: new Date().toISOString(),
 			ts,
@@ -155,6 +156,7 @@ export class ChannelStore {
 			text,
 			attachments: [],
 			isBot: true,
+			threadRootTs,
 		});
 	}
 
