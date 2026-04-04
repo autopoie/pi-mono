@@ -24,6 +24,11 @@ export interface RequestedStopStatus {
 	requestId: number;
 }
 
+export interface StopHandlingPlan {
+	abortActive: boolean;
+	postImmediateStopped: boolean;
+}
+
 type StopStatusLogger = (summary: string, detail: string) => void;
 
 function sameConversationMessageTarget(left: ConversationMessageTarget, right: ConversationMessageTarget): boolean {
@@ -34,6 +39,67 @@ export function resolveConversationMessageTarget(scope: ConversationScope): Conv
 	return {
 		channelId: scope.channelId,
 		threadRootTs: scope.threadRootTs,
+	};
+}
+
+export function isSameConversationTarget(params: {
+	target?: ConversationMessageTarget;
+	requesterScope: ConversationScope;
+}): boolean {
+	const { target, requesterScope } = params;
+	if (!target) {
+		return false;
+	}
+
+	return sameConversationMessageTarget(target, resolveConversationMessageTarget(requesterScope));
+}
+
+export function canStopActiveTarget(params: {
+	activeTarget?: ConversationMessageTarget;
+	requesterScope: ConversationScope;
+}): boolean {
+	const { activeTarget, requesterScope } = params;
+	if (!activeTarget) {
+		return false;
+	}
+	if (isSameConversationTarget({ target: activeTarget, requesterScope })) {
+		return true;
+	}
+
+	const requesterTarget = resolveConversationMessageTarget(requesterScope);
+	return activeTarget.threadRootTs === undefined && activeTarget.channelId === requesterTarget.channelId;
+}
+
+export function resolveStopHandlingPlan(params: {
+	hasActiveRun: boolean;
+	activeTarget?: ConversationMessageTarget;
+	requesterScope: ConversationScope;
+	cancelledQueuedRuns: number;
+}): StopHandlingPlan {
+	const { hasActiveRun, activeTarget, requesterScope, cancelledQueuedRuns } = params;
+	if (
+		hasActiveRun &&
+		canStopActiveTarget({
+			activeTarget,
+			requesterScope,
+		})
+	) {
+		return {
+			abortActive: true,
+			postImmediateStopped: false,
+		};
+	}
+
+	if (cancelledQueuedRuns > 0) {
+		return {
+			abortActive: false,
+			postImmediateStopped: true,
+		};
+	}
+
+	return {
+		abortActive: false,
+		postImmediateStopped: false,
 	};
 }
 

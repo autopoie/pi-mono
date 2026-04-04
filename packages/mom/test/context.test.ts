@@ -125,6 +125,177 @@ describe("mom context log sync", () => {
 		expect(resolveLoggedThreadRootTs("D123", "1000.1")).toBeUndefined();
 	});
 
+	it("does not replay later same-thread messages into an earlier queued run", () => {
+		const channelDir = mkdtempSync(join(tmpdir(), "mom-context-cutoff-"));
+		tempDirs.push(channelDir);
+		const sessionDir = join(channelDir, "sessions", "1000.1");
+		mkdirSync(sessionDir, { recursive: true });
+		writeFileSync(
+			join(channelDir, "log.jsonl"),
+			`${[
+				JSON.stringify({
+					date: "2026-04-03T12:00:00.000Z",
+					ts: "1000.1",
+					user: "U1",
+					userName: "alice",
+					text: "thread root",
+					attachments: [],
+					isBot: false,
+					threadRootTs: "1000.1",
+				}),
+				JSON.stringify({
+					date: "2026-04-03T12:01:00.000Z",
+					ts: "1001.1",
+					user: "U1",
+					userName: "alice",
+					text: "queued message 1",
+					attachments: [],
+					isBot: false,
+					threadRootTs: "1000.1",
+				}),
+				JSON.stringify({
+					date: "2026-04-03T12:02:00.000Z",
+					ts: "1002.1",
+					user: "U1",
+					userName: "alice",
+					text: "queued message 2",
+					attachments: [],
+					isBot: false,
+					threadRootTs: "1000.1",
+				}),
+			].join("\n")}
+`,
+		);
+
+		const sessionManager = SessionManager.inMemory(channelDir);
+		const scope = resolveConversationScope({
+			type: "mention",
+			channel: "C123",
+			ts: "1001.1",
+			threadTs: "1000.1",
+		});
+
+		const syncedCount = syncLogToSessionManager(sessionManager, channelDir, scope, "1001.1", "1001.1");
+		const historyTarget = prepareHistoryAccessTarget(channelDir, sessionDir, scope, "1001.1");
+
+		expect(syncedCount).toBe(1);
+		expect(getUserTexts(sessionManager)).toEqual(["[alice]: thread root"]);
+		expect(readFileSync(historyTarget.historyFile, "utf-8").trim().split("\n")).toEqual([
+			JSON.stringify({
+				date: "2026-04-03T12:00:00.000Z",
+				ts: "1000.1",
+				user: "U1",
+				userName: "alice",
+				text: "thread root",
+				attachments: [],
+				isBot: false,
+				threadRootTs: "1000.1",
+			}),
+		]);
+	});
+
+	it("keeps queued DM history cutoff to the triggering message timestamp", () => {
+		const channelDir = mkdtempSync(join(tmpdir(), "mom-context-dm-cutoff-"));
+		tempDirs.push(channelDir);
+		writeFileSync(
+			join(channelDir, "log.jsonl"),
+			`${[
+				JSON.stringify({
+					date: "2026-04-03T12:00:00.000Z",
+					ts: "1000.1",
+					user: "U1",
+					userName: "alice",
+					text: "first dm",
+					attachments: [],
+					isBot: false,
+				}),
+				JSON.stringify({
+					date: "2026-04-03T12:01:00.000Z",
+					ts: "1001.1",
+					user: "U1",
+					userName: "alice",
+					text: "queued dm 1",
+					attachments: [],
+					isBot: false,
+				}),
+				JSON.stringify({
+					date: "2026-04-03T12:02:00.000Z",
+					ts: "1002.1",
+					user: "U1",
+					userName: "alice",
+					text: "queued dm 2",
+					attachments: [],
+					isBot: false,
+				}),
+			].join("\n")}
+`,
+		);
+
+		const sessionManager = SessionManager.inMemory(channelDir);
+		const scope = resolveConversationScope({
+			type: "dm",
+			channel: "D123",
+			ts: "1001.1",
+		});
+
+		const syncedCount = syncLogToSessionManager(sessionManager, channelDir, scope, "1001.1", "1001.1");
+		const historyTarget = prepareHistoryAccessTarget(channelDir, channelDir, scope, "1001.1");
+
+		expect(syncedCount).toBe(1);
+		expect(getUserTexts(sessionManager)).toEqual(["[alice]: first dm"]);
+		expect(historyTarget).toEqual({
+			historyFile: join(channelDir, "history.jsonl"),
+			mode: "channel-history",
+		});
+		expect(readFileSync(historyTarget.historyFile, "utf-8").trim().split("\n")).toEqual([
+			JSON.stringify({
+				date: "2026-04-03T12:00:00.000Z",
+				ts: "1000.1",
+				user: "U1",
+				userName: "alice",
+				text: "first dm",
+				attachments: [],
+				isBot: false,
+			}),
+		]);
+	});
+
+	it("preserves cutoff metadata when falling back to raw channel log history", () => {
+		const channelDir = mkdtempSync(join(tmpdir(), "mom-context-fallback-cutoff-"));
+		tempDirs.push(channelDir);
+		const blockedSessionPath = join(channelDir, "blocked-session");
+		writeFileSync(blockedSessionPath, "not a directory\n");
+		writeFileSync(
+			join(channelDir, "log.jsonl"),
+			`${JSON.stringify({
+				date: "2026-04-03T12:00:00.000Z",
+				ts: "1000.1",
+				user: "U1",
+				userName: "alice",
+				text: "first dm",
+				attachments: [],
+				isBot: false,
+			})}\n`,
+		);
+
+		const historyTarget = prepareHistoryAccessTarget(
+			channelDir,
+			blockedSessionPath,
+			resolveConversationScope({
+				type: "dm",
+				channel: "D123",
+				ts: "1001.1",
+			}),
+			"1001.1",
+		);
+
+		expect(historyTarget).toEqual({
+			historyFile: join(channelDir, "log.jsonl"),
+			mode: "channel-filtered-channel-log",
+			cutoffSlackTs: "1001.1",
+		});
+	});
+
 	it("includes a channel-root bot event message in derived thread history for replies to that root", () => {
 		const channelDir = mkdtempSync(join(tmpdir(), "mom-history-event-root-"));
 		tempDirs.push(channelDir);

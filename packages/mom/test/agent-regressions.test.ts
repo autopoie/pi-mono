@@ -166,13 +166,38 @@ describe("mom agent regressions", () => {
 			historyAccess: {
 				historyFile: "/workspace/C123/log.jsonl",
 				mode: "thread-filtered-channel-log",
+				cutoffSlackTs: "1001.1",
 			},
 			isDocker: false,
 		});
 
 		expect(promptSection).toContain("query `/workspace/C123/log.jsonl` with an explicit thread filter");
-		expect(promptSection).toContain('select(.threadRootTs == "1000.1")');
+		expect(promptSection).toContain('select(.threadRootTs == "1000.1" and (.ts | tonumber) < 1001.1)');
+		expect(promptSection).toContain("Exclude any message with ts >= 1001.1");
 		expect(promptSection).not.toContain("history.jsonl");
+	});
+
+	it("uses cutoff-filtered raw log guidance when channel history snapshot materialization is unavailable", () => {
+		const promptSection = buildHistoryAccessPromptSection({
+			conversationScope: resolveConversationScope({
+				type: "dm",
+				channel: "D123",
+				ts: "1001.1",
+			}),
+			channelPath: "/workspace/D123",
+			sessionPath: "/workspace/D123",
+			historyAccess: {
+				historyFile: "/workspace/D123/log.jsonl",
+				mode: "channel-filtered-channel-log",
+				cutoffSlackTs: "1001.1",
+			},
+			isDocker: false,
+		});
+
+		expect(promptSection).toContain("explicit timestamp cutoff");
+		expect(promptSection).toContain("Exclude any message with ts >= 1001.1");
+		expect(promptSection).toContain("select((.ts | tonumber) < 1001.1)");
+		expect(promptSection).toContain("/workspace/D123/log.jsonl");
 	});
 
 	it("scrubs persisted Responses replay metadata while preserving durable assistant metadata", () => {

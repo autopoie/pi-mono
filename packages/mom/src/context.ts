@@ -38,7 +38,13 @@ interface ParsedLogLine {
 
 export interface HistoryAccessTarget {
 	historyFile: string;
-	mode: "channel-log" | "thread-history" | "thread-filtered-channel-log";
+	mode:
+		| "channel-log"
+		| "channel-history"
+		| "channel-filtered-channel-log"
+		| "thread-history"
+		| "thread-filtered-channel-log";
+	cutoffSlackTs?: string;
 }
 
 export interface LegacyThreadHistoryState {
@@ -87,6 +93,23 @@ function isLogMessageInScope(message: LogMessage, scope: ConversationScope): boo
 	}
 
 	return message.threadRootTs === scope.threadRootTs;
+}
+
+function isLogMessageBeforeSlackTs(message: LogMessage, beforeSlackTs?: string): boolean {
+	if (!beforeSlackTs) {
+		return true;
+	}
+	if (!message.ts) {
+		return false;
+	}
+
+	const messageTs = Number.parseFloat(message.ts);
+	const upperBoundTs = Number.parseFloat(beforeSlackTs);
+	if (!Number.isFinite(messageTs) || !Number.isFinite(upperBoundTs)) {
+		return true;
+	}
+
+	return messageTs < upperBoundTs;
 }
 
 function normalizeUserContentForSync(content: string): string {
@@ -171,9 +194,10 @@ export function prepareHistoryAccessTarget(
 	channelDir: string,
 	sessionDir: string,
 	scope: ConversationScope,
+	beforeSlackTs?: string,
 ): HistoryAccessTarget {
 	const channelLogFile = join(channelDir, "log.jsonl");
-	if (scope.kind !== "thread") {
+	if (scope.kind !== "thread" && !beforeSlackTs) {
 		return {
 			historyFile: channelLogFile,
 			mode: "channel-log",
@@ -183,17 +207,20 @@ export function prepareHistoryAccessTarget(
 	const historyFile = join(sessionDir, "history.jsonl");
 	try {
 		const scopedLines = readParsedLogLines(channelDir)
-			.filter(({ message }) => isLogMessageInScope(message, scope))
+			.filter(
+				({ message }) => isLogMessageInScope(message, scope) && isLogMessageBeforeSlackTs(message, beforeSlackTs),
+			)
 			.map(({ rawLine }) => rawLine);
 		writeFileSync(historyFile, scopedLines.length > 0 ? `${scopedLines.join("\n")}\n` : "", "utf-8");
 		return {
 			historyFile,
-			mode: "thread-history",
+			mode: scope.kind === "thread" ? "thread-history" : "channel-history",
 		};
 	} catch {
 		return {
 			historyFile: channelLogFile,
-			mode: "thread-filtered-channel-log",
+			mode: scope.kind === "thread" ? "thread-filtered-channel-log" : "channel-filtered-channel-log",
+			...(beforeSlackTs ? { cutoffSlackTs: beforeSlackTs } : {}),
 		};
 	}
 }
@@ -215,6 +242,7 @@ export function syncLogToSessionManager(
 	channelDir: string,
 	scope: ConversationScope,
 	excludeSlackTs?: string,
+	beforeSlackTs?: string,
 ): number {
 	const existingMessages = new Set<string>();
 	for (const entry of sessionManager.getEntries()) {
@@ -254,7 +282,7 @@ export function syncLogToSessionManager(
 		if (excludeSlackTs && slackTs === excludeSlackTs) {
 			continue;
 		}
-		if (logMsg.isBot || !isLogMessageInScope(logMsg, scope)) {
+		if (logMsg.isBot || !isLogMessageInScope(logMsg, scope) || !isLogMessageBeforeSlackTs(logMsg, beforeSlackTs)) {
 			continue;
 		}
 

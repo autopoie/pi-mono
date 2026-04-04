@@ -473,7 +473,13 @@ async function runInitializedRunner({
 		);
 	}
 
-	const syncedCount = syncLogToSessionManager(state.sessionManager, channelDir, conversationScope, ctx.message.ts);
+	const syncedCount = syncLogToSessionManager(
+		state.sessionManager,
+		channelDir,
+		conversationScope,
+		ctx.message.ts,
+		ctx.message.ts,
+	);
 	if (syncedCount > 0) {
 		log.logInfo(`[${conversationKey}] Synced ${syncedCount} messages from log.jsonl`);
 	}
@@ -484,8 +490,8 @@ async function runInitializedRunner({
 		log.logInfo(`[${conversationKey}] Reloaded ${reloadedSession.messages.length} messages from context`);
 	}
 
-	const historyAccess = prepareHistoryAccessTarget(channelDir, sessionDir, conversationScope);
-	if (historyAccess.mode === "thread-filtered-channel-log") {
+	const historyAccess = prepareHistoryAccessTarget(channelDir, sessionDir, conversationScope, ctx.message.ts);
+	if (historyAccess.mode === "thread-filtered-channel-log" || historyAccess.mode === "channel-filtered-channel-log") {
 		log.logWarning(
 			`[${conversationKey}] Scoped history view unavailable`,
 			`Falling back to filtered ${join(channelDir, "log.jsonl")}`,
@@ -973,16 +979,18 @@ function buildPromptHistoryAccessTarget(
 	historyAccess: HistoryAccessTarget,
 ): HistoryAccessTarget {
 	const channelPath = `${workspacePath}/${channelId}`;
-	if (historyAccess.mode === "thread-history") {
+	if (historyAccess.mode === "thread-history" || historyAccess.mode === "channel-history") {
 		return {
 			historyFile: `${buildSessionPath(workspacePath, channelId, conversationScope)}/history.jsonl`,
 			mode: historyAccess.mode,
+			cutoffSlackTs: historyAccess.cutoffSlackTs,
 		};
 	}
 
 	return {
 		historyFile: `${channelPath}/log.jsonl`,
 		mode: historyAccess.mode,
+		cutoffSlackTs: historyAccess.cutoffSlackTs,
 	};
 }
 
@@ -1056,23 +1064,69 @@ grep '"userName":"mario"' ${historyAccess.historyFile} | tail -20 | jq -c '{date
 \`\`\``;
 		}
 
+		const cutoffFilter = historyAccess.cutoffSlackTs
+			? ` and (.ts | tonumber) < ${Number.parseFloat(historyAccess.cutoffSlackTs)}`
+			: "";
+		const cutoffGuidance = historyAccess.cutoffSlackTs
+			? ` Exclude any message with ts >= ${historyAccess.cutoffSlackTs} because newer queued messages belong to later turns.`
+			: "";
 		return `## Log Queries (for older history)
 Format: \`{"date":"...","ts":"...","user":"...","userName":"...","text":"...","isBot":false}\`
 The log contains user messages and your final responses (not tool calls/results).
 You are replying in the Slack thread rooted at \`${conversationScope.threadRootTs}\`.
 This thread's session directory is \`${sessionPath}\`.
-The scoped history file for this thread is temporarily unavailable, so if you need older history, query \`${channelPath}/log.jsonl\` with an explicit thread filter.
-Do not inspect \`${channelPath}/log.jsonl\` without filtering to \`threadRootTs == "${conversationScope.threadRootTs}"\` unless the user explicitly asks for broader channel-wide or cross-thread history.
+The scoped history file for this thread is temporarily unavailable, so if you need older history, query \`${channelPath}/log.jsonl\` with an explicit thread filter.${cutoffGuidance}
+Do not inspect \`${channelPath}/log.jsonl\` without filtering to \`threadRootTs == "${conversationScope.threadRootTs}"\`${historyAccess.cutoffSlackTs ? ` and \`ts < ${historyAccess.cutoffSlackTs}\`` : ""} unless the user explicitly asks for broader channel-wide or cross-thread history.
 Do not use the read tool on whole history files; raw tool output is visible in Slack. Use bash with tail, grep, and jq to extract only the few lines you need.
 ${installJqLine}\`\`\`bash
 # Recent messages in this thread
-jq -c 'select(.threadRootTs == "${conversationScope.threadRootTs}") | {date: .date[0:19], user: (.userName // .user), text}' ${channelPath}/log.jsonl | tail -30
+jq -c 'select(.threadRootTs == "${conversationScope.threadRootTs}"${cutoffFilter}) | {date: .date[0:19], user: (.userName // .user), text}' ${channelPath}/log.jsonl | tail -30
 
 # Search this thread for a specific topic
-jq -c 'select(.threadRootTs == "${conversationScope.threadRootTs}")' ${channelPath}/log.jsonl | grep -i "topic" | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
+jq -c 'select(.threadRootTs == "${conversationScope.threadRootTs}"${cutoffFilter})' ${channelPath}/log.jsonl | grep -i "topic" | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
 
 # Messages from a specific user in this thread
-jq -c 'select(.threadRootTs == "${conversationScope.threadRootTs}")' ${channelPath}/log.jsonl | grep '"userName":"mario"' | tail -20 | jq -c '{date: .date[0:19], text}'
+jq -c 'select(.threadRootTs == "${conversationScope.threadRootTs}"${cutoffFilter})' ${channelPath}/log.jsonl | grep '"userName":"mario"' | tail -20 | jq -c '{date: .date[0:19], text}'
+\`\`\``;
+	}
+
+	if (historyAccess.mode === "channel-history") {
+		return `## Log Queries (for older history)
+Format: \`{"date":"...","ts":"...","user":"...","userName":"...","text":"...","isBot":false}\`
+The log contains user messages and your final responses (not tool calls/results).
+Default history file for this conversation: \`${historyAccess.historyFile}\`
+Use \`${historyAccess.historyFile}\` for older history in this conversation.
+Do not use the read tool on whole history files; raw tool output is visible in Slack. Use bash with tail, grep, and jq to extract only the few lines you need.
+${installJqLine}\`\`\`bash
+# Recent messages
+tail -30 ${historyAccess.historyFile} | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
+
+# Search for specific topic
+grep -i "topic" ${historyAccess.historyFile} | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
+
+# Messages from specific user
+grep '"userName":"mario"' ${historyAccess.historyFile} | tail -20 | jq -c '{date: .date[0:19], text}'
+\`\`\``;
+	}
+
+	if (historyAccess.mode === "channel-filtered-channel-log") {
+		const cutoffFilter = historyAccess.cutoffSlackTs
+			? `select((.ts | tonumber) < ${Number.parseFloat(historyAccess.cutoffSlackTs)}) | `
+			: "";
+		return `## Log Queries (for older history)
+Format: \`{"date":"...","ts":"...","user":"...","userName":"...","text":"...","isBot":false}\`
+The log contains user messages and your final responses (not tool calls/results).
+The scoped history file for this conversation is temporarily unavailable, so if you need older history, query \`${channelPath}/log.jsonl\` with an explicit timestamp cutoff. Exclude any message with ts >= ${historyAccess.cutoffSlackTs} because newer queued messages belong to later turns.
+Do not use the read tool on whole history files; raw tool output is visible in Slack. Use bash with tail, grep, and jq to extract only the few lines you need.
+${installJqLine}\`\`\`bash
+# Recent messages in this conversation before the current turn
+jq -c '${cutoffFilter}{date: .date[0:19], user: (.userName // .user), text}' ${channelPath}/log.jsonl | tail -30
+
+# Search for specific topic before the current turn
+jq -c '${cutoffFilter}.' ${channelPath}/log.jsonl | grep -i "topic" | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
+
+# Messages from specific user before the current turn
+jq -c '${cutoffFilter}.' ${channelPath}/log.jsonl | grep '"userName":"mario"' | tail -20 | jq -c '{date: .date[0:19], text}'
 \`\`\``;
 	}
 

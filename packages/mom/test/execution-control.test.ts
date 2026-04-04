@@ -3,10 +3,13 @@ import { describe, expect, it, vi } from "vitest";
 import { resolveConversationScope } from "../src/conversation-scope.js";
 import {
 	abortActiveRunAndRequestStopStatus,
+	canStopActiveTarget,
+	isSameConversationTarget,
 	postRequestedStopStatus,
 	publishStoppedStatus,
 	requestStopStatus,
 	resolveConversationMessageTarget,
+	resolveStopHandlingPlan,
 	type StopStatusState,
 } from "../src/execution-control.js";
 
@@ -28,20 +31,35 @@ function createChannelRootExecutionTarget(channelId: string) {
 }
 
 describe("mom execution control", () => {
-	it("marks the active thread stopped when stop is requested from a different thread", async () => {
-		const slack = createSlackStub();
-		const executionState: StopStatusState = {
-			stopRequested: false,
-			activeRunId: 1,
-			activeTarget: resolveConversationMessageTarget(
-				resolveConversationScope({
-					type: "mention",
-					channel: "C123",
-					ts: "2000.1",
-					threadTs: "2000.1",
-				}),
-			),
-		};
+	it("allows a thread to stop only its own active mention run", () => {
+		const activeTarget = resolveConversationMessageTarget(
+			resolveConversationScope({
+				type: "mention",
+				channel: "C123",
+				ts: "2000.1",
+				threadTs: "2000.1",
+			}),
+		);
+		const requesterScope = resolveConversationScope({
+			type: "mention",
+			channel: "C123",
+			ts: "2000.1",
+			threadTs: "2000.1",
+		});
+
+		expect(isSameConversationTarget({ target: activeTarget, requesterScope })).toBe(true);
+		expect(canStopActiveTarget({ activeTarget, requesterScope })).toBe(true);
+	});
+
+	it("does not let a different mention thread stop the active mention run", () => {
+		const activeTarget = resolveConversationMessageTarget(
+			resolveConversationScope({
+				type: "mention",
+				channel: "C123",
+				ts: "2000.1",
+				threadTs: "2000.1",
+			}),
+		);
 		const requesterScope = resolveConversationScope({
 			type: "mention",
 			channel: "C123",
@@ -49,29 +67,73 @@ describe("mom execution control", () => {
 			threadTs: "3000.1",
 		});
 
-		const requestedStatus = requestStopStatus({
-			executionState,
-			requesterScope,
-		});
-		await postRequestedStopStatus({
-			slack,
-			executionState,
-			requestedStatus,
-		});
-		await publishStoppedStatus({
-			slack,
-			executionState,
-			fallbackScope: requesterScope,
+		expect(isSameConversationTarget({ target: activeTarget, requesterScope })).toBe(false);
+		expect(canStopActiveTarget({ activeTarget, requesterScope })).toBe(false);
+	});
+
+	it("still lets same-channel stop interrupt a channel-scoped active run", () => {
+		const requesterScope = resolveConversationScope({
+			type: "mention",
+			channel: "C123",
+			ts: "3000.1",
+			threadTs: "3000.1",
 		});
 
-		expect(slack.postConversationMessage).toHaveBeenNthCalledWith(1, "C123", "2000.1", "_Stopping..._");
-		expect(slack.postConversationMessage).toHaveBeenNthCalledWith(
-			2,
-			"C123",
-			"3000.1",
-			"_Stop requested for active run in another thread._",
-		);
-		expect(slack.updateMessage).toHaveBeenCalledWith("C123", "stop-ts-1", "_Stopped_");
+		expect(
+			canStopActiveTarget({
+				activeTarget: createChannelRootExecutionTarget("C123"),
+				requesterScope,
+			}),
+		).toBe(true);
+	});
+
+	it("cancels queued requester work without aborting another active mention thread", () => {
+		const requesterScope = resolveConversationScope({
+			type: "mention",
+			channel: "C123",
+			ts: "3000.1",
+			threadTs: "3000.1",
+		});
+
+		expect(
+			resolveStopHandlingPlan({
+				hasActiveRun: true,
+				activeTarget: resolveConversationMessageTarget(
+					resolveConversationScope({
+						type: "mention",
+						channel: "C123",
+						ts: "2000.1",
+						threadTs: "2000.1",
+					}),
+				),
+				requesterScope,
+				cancelledQueuedRuns: 1,
+			}),
+		).toEqual({
+			abortActive: false,
+			postImmediateStopped: true,
+		});
+	});
+
+	it("still aborts a channel-root active run even when the requester also cancelled queued work", () => {
+		const requesterScope = resolveConversationScope({
+			type: "mention",
+			channel: "C123",
+			ts: "3000.1",
+			threadTs: "3000.1",
+		});
+
+		expect(
+			resolveStopHandlingPlan({
+				hasActiveRun: true,
+				activeTarget: createChannelRootExecutionTarget("C123"),
+				requesterScope,
+				cancelledQueuedRuns: 1,
+			}),
+		).toEqual({
+			abortActive: true,
+			postImmediateStopped: false,
+		});
 	});
 
 	it("updates channel-root event stop status when stop is requested from a thread", async () => {
