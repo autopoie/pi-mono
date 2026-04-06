@@ -10,6 +10,7 @@ import {
 	type ConversationMessageTarget,
 	publishStoppedStatus,
 	resolveConversationMessageTarget,
+	resolveStopHandlingPlan,
 } from "./execution-control.js";
 import { resolveMomTrustConfig, validateStrictTrustBoundary } from "./extensions.js";
 import * as log from "./log.js";
@@ -344,14 +345,17 @@ function createSlackContext(
 }
 
 const handler: MomHandler = {
-	isRunning(channelId: string): boolean {
-		const state = channelExecutionStates.get(channelId);
-		return state?.running ?? false;
-	},
-
 	async handleStop(event: SlackEvent, scope: ConversationScope, slack: SlackBot): Promise<void> {
 		const executionState = channelExecutionStates.get(resolveExecutionChannelId(scope));
-		if (executionState?.running && executionState.activeRunner) {
+		const cancelledQueuedRuns = slack.cancelQueuedConversation(scope);
+		const plan = resolveStopHandlingPlan({
+			hasActiveRun: executionState?.running === true && executionState.activeRunner !== undefined,
+			activeTarget: executionState?.activeTarget,
+			requesterScope: scope,
+			cancelledQueuedRuns,
+		});
+
+		if (plan.abortActive && executionState?.activeRunner) {
 			const activeRunner = executionState.activeRunner;
 			abortActiveRunAndRequestStopStatus({
 				slack,
@@ -360,6 +364,11 @@ const handler: MomHandler = {
 				abort: () => activeRunner.abort(),
 				onWarning: (summary, detail) => log.logWarning(`[${scope.key}] ${summary}`, detail),
 			});
+			return;
+		}
+
+		if (plan.postImmediateStopped) {
+			await slack.postConversationMessage(event.channel, scope.threadRootTs, "_Stopped_");
 			return;
 		}
 
