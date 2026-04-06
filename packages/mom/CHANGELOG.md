@@ -8,7 +8,7 @@
 
 ### Changed
 
-- Changed mom to read workspace settings from `.pi/settings.json`, ignore workspace extension authorities in strict mode, post channel mention replies in the triggering Slack thread, persist separate session context per channel mention thread, queue same-channel Slack requests instead of rejecting them with a shared per-channel pending cap, and keep execution serialized per channel while DMs remain channel-scoped
+- Changed mom to read workspace settings from `.pi/settings.json`, ignore workspace extension authorities in strict mode, post channel mention replies in the triggering Slack thread, persist separate session context per channel mention thread, queue same-channel Slack requests instead of rejecting them, post a lightweight queued acknowledgment in the waiting thread or DM, enforce a shared per-channel pending cap, and keep execution serialized per channel while DMs remain channel-scoped
 - Changed Slack-only tool-result and usage-summary customization to use mom-local `mom-display-control`, while `tool_result` remains a canonical mutation hook
 - Changed mom startup rehydration to scrub persisted OpenAI Responses replay metadata from restored session context so restart-only reasoning and tool-call item IDs are not carried across pod restarts
 - Changed thread-scoped mention sessions to derive a scoped `history.jsonl` from the channel log and use that as the default older-history query surface, reserving channel-wide `log.jsonl` access for explicit broader-history requests and logging when older channel-scoped history cannot be replayed automatically after the upgrade

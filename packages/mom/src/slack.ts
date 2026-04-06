@@ -121,6 +121,10 @@ export class ChannelQueue {
 		this.processNext();
 	}
 
+	hasInFlightWork(): boolean {
+		return this.processing || this.queue.length > 0;
+	}
+
 	cancelPending(conversationKey: string): number {
 		const originalLength = this.queue.length;
 		this.queue = this.queue.filter((item) => item.conversationKey !== conversationKey);
@@ -282,7 +286,8 @@ export class SlackBot {
 	 */
 	enqueueEvent(event: SlackEvent): boolean {
 		const scope = resolveConversationScope(event, { isEvent: true });
-		if (!this.enqueueConversationEvent(event, scope, { isEvent: true })) {
+		const enqueueResult = this.enqueueConversationEvent(event, scope, { isEvent: true });
+		if (!enqueueResult.accepted) {
 			const executionChannelId = resolveExecutionChannelId(scope);
 			log.logWarning(`Event queue full for ${executionChannelId}, discarding: ${event.text.substring(0, 50)}`);
 			return false;
@@ -313,16 +318,27 @@ export class SlackBot {
 		event: SlackEvent,
 		scope: ConversationScope,
 		options?: { isEvent?: boolean },
-	): boolean {
+	): { accepted: boolean; queued: boolean } {
 		const executionChannelId = resolveExecutionChannelId(scope);
 		const queue = this.getQueue(executionChannelId);
 		if (!hasPendingChannelCapacity(queue)) {
-			return false;
+			return { accepted: false, queued: false };
 		}
+		const queued = queue.hasInFlightWork();
 		queue.enqueue(() => this.handler.handleEvent(event, scope, this, options?.isEvent), {
 			conversationKey: scope.key,
 		});
-		return true;
+		return { accepted: true, queued };
+	}
+
+	private postQueuedReply(channel: string, threadRootTs: string | undefined): void {
+		void this.postConversationMessage(
+			channel,
+			threadRootTs,
+			"_Task queued. I'll respond here when your task kicks off._",
+		).catch((error) => {
+			log.logWarning("Queued reply error", error instanceof Error ? error.message : String(error));
+		});
 	}
 
 	private postQueueFullReply(channel: string, threadRootTs: string | undefined): void {
@@ -384,9 +400,12 @@ export class SlackBot {
 				return;
 			}
 
-			if (!this.enqueueConversationEvent(slackEvent, scope)) {
+			const enqueueResult = this.enqueueConversationEvent(slackEvent, scope);
+			if (!enqueueResult.accepted) {
 				log.logWarning(`[${scope.key}] Queue full`, `Rejecting Slack work: ${slackEvent.text.substring(0, 50)}`);
 				this.postQueueFullReply(e.channel, scope.threadRootTs);
+			} else if (enqueueResult.queued) {
+				this.postQueuedReply(e.channel, scope.threadRootTs);
 			}
 
 			ack();
@@ -462,9 +481,12 @@ export class SlackBot {
 					return;
 				}
 
-				if (!this.enqueueConversationEvent(slackEvent, scope)) {
+				const enqueueResult = this.enqueueConversationEvent(slackEvent, scope);
+				if (!enqueueResult.accepted) {
 					log.logWarning(`[${scope.key}] Queue full`, `Rejecting Slack work: ${slackEvent.text.substring(0, 50)}`);
 					this.postQueueFullReply(e.channel, scope.threadRootTs);
+				} else if (enqueueResult.queued) {
+					this.postQueuedReply(e.channel, scope.threadRootTs);
 				}
 			}
 
