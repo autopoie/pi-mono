@@ -123,6 +123,75 @@ describe("mom slack queueing", () => {
 		await flushQueue();
 	});
 
+	it("posts a queued acknowledgment only for later same-channel mention threads", async () => {
+		let releaseActive!: () => void;
+		const activeRun = new Promise<void>((resolve) => {
+			releaseActive = resolve;
+		});
+		let startedCount = 0;
+		const { bot, appMentionHandler } = createSlackBotHarness({
+			handleEventImpl: async () => {
+				startedCount += 1;
+				if (startedCount === 1) {
+					await activeRun;
+				}
+			},
+		});
+
+		const ack = vi.fn();
+		appMentionHandler({ event: { text: "first", channel: "C123", user: "U1", ts: "1000.1" }, ack });
+		appMentionHandler({ event: { text: "second", channel: "C123", user: "U1", ts: "2000.1" }, ack });
+		await flushQueue();
+
+		expect(bot.postConversationMessage).not.toHaveBeenCalledWith(
+			"C123",
+			"1000.1",
+			"_Task queued. I'll respond here when your task kicks off._",
+		);
+		expect(bot.postConversationMessage).toHaveBeenCalledWith(
+			"C123",
+			"2000.1",
+			"_Task queued. I'll respond here when your task kicks off._",
+		);
+
+		releaseActive();
+		await flushQueue();
+	});
+
+	it("posts a queued acknowledgment in the DM root when later DM work waits behind active work", async () => {
+		let releaseActive!: () => void;
+		const activeRun = new Promise<void>((resolve) => {
+			releaseActive = resolve;
+		});
+		let startedCount = 0;
+		const { bot, messageHandler } = createSlackBotHarness({
+			handleEventImpl: async () => {
+				startedCount += 1;
+				if (startedCount === 1) {
+					await activeRun;
+				}
+			},
+		});
+
+		const ack = vi.fn();
+		messageHandler({ event: { text: "first", channel: "D123", channel_type: "im", user: "U1", ts: "1000.1" }, ack });
+		await flushQueue();
+		expect(bot.postConversationMessage).not.toHaveBeenCalled();
+
+		messageHandler({ event: { text: "second", channel: "D123", channel_type: "im", user: "U1", ts: "2000.1" }, ack });
+		await flushQueue();
+
+		expect(bot.postConversationMessage).toHaveBeenCalledTimes(1);
+		expect(bot.postConversationMessage).toHaveBeenCalledWith(
+			"D123",
+			undefined,
+			"_Task queued. I'll respond here when your task kicks off._",
+		);
+
+		releaseActive();
+		await flushQueue();
+	});
+
 	it("posts queue-full replies in the correct mention thread target", async () => {
 		let releaseActive!: () => void;
 		const activeRun = new Promise<void>((resolve) => {
