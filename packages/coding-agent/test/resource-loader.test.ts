@@ -276,6 +276,17 @@ Content`,
 			expect(agentsFiles.some((f) => f.path.includes("AGENTS.md"))).toBe(true);
 		});
 
+		it("should skip AGENTS.md and CLAUDE.md discovery when noContextFiles is true", async () => {
+			writeFileSync(join(cwd, "AGENTS.md"), "# Project Guidelines\n\nBe helpful.");
+			writeFileSync(join(cwd, "CLAUDE.md"), "# Claude Guidelines\n\nBe helpful.");
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir, noContextFiles: true });
+			await loader.reload();
+
+			const { agentsFiles } = loader.getAgentsFiles();
+			expect(agentsFiles).toEqual([]);
+		});
+
 		it("should discover SYSTEM.md from cwd/.pi", async () => {
 			const piDir = join(cwd, ".pi");
 			mkdirSync(piDir, { recursive: true });
@@ -460,7 +471,7 @@ Content`,
 				join(ext1Dir, "index.ts"),
 				`
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 export default function(pi: ExtensionAPI) {
   pi.registerTool({
     name: "duplicate-tool",
@@ -475,7 +486,7 @@ export default function(pi: ExtensionAPI) {
 				join(ext2Dir, "index.ts"),
 				`
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 export default function(pi: ExtensionAPI) {
   pi.registerTool({
     name: "duplicate-tool",
@@ -502,7 +513,7 @@ export default function(pi: ExtensionAPI) {
 				join(globalExtDir, "global.ts"),
 				`
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 export default function(pi: ExtensionAPI) {
   pi.registerTool({
     name: "duplicate-tool",
@@ -521,7 +532,7 @@ export default function(pi: ExtensionAPI) {
 				explicitExtPath,
 				`
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 export default function(pi: ExtensionAPI) {
   pi.registerTool({
     name: "duplicate-tool",

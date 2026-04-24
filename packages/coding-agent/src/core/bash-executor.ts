@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import stripAnsi from "strip-ansi";
 import { sanitizeBinaryOutput } from "../utils/shell.js";
-import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
+import type { BashOperations } from "./tools/bash.js";
 import { DEFAULT_MAX_BYTES, truncateTail } from "./tools/truncate.js";
 
 // ============================================================================
@@ -44,23 +44,6 @@ export interface BashResult {
 // ============================================================================
 
 /**
- * Execute a bash command with optional streaming and cancellation support.
- *
- * Uses the same local BashOperations backend as createBashTool() so interactive
- * user bash and tool-invoked bash share the same process spawning behavior.
- * Sanitization, newline normalization, temp-file capture, and truncation still
- * happen in executeBashWithOperations(), so reusing the local backend does not
- * change output processing behavior.
- *
- * @param command - The bash command to execute
- * @param options - Optional streaming callback and abort signal
- * @returns Promise resolving to execution result
- */
-export function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
-	return executeBashWithOperations(command, process.cwd(), createLocalBashOperations(), options);
-}
-
-/**
  * Execute a bash command using custom BashOperations.
  * Used for remote execution (SSH, containers, etc.).
  */
@@ -78,6 +61,18 @@ export async function executeBashWithOperations(
 	let tempFileStream: WriteStream | undefined;
 	let totalBytes = 0;
 
+	const ensureTempFile = () => {
+		if (tempFilePath) {
+			return;
+		}
+		const id = randomBytes(8).toString("hex");
+		tempFilePath = join(tmpdir(), `pi-bash-${id}.log`);
+		tempFileStream = createWriteStream(tempFilePath);
+		for (const chunk of outputChunks) {
+			tempFileStream.write(chunk);
+		}
+	};
+
 	const decoder = new TextDecoder();
 
 	const onData = (data: Buffer) => {
@@ -87,13 +82,8 @@ export async function executeBashWithOperations(
 		const text = sanitizeBinaryOutput(stripAnsi(decoder.decode(data, { stream: true }))).replace(/\r/g, "");
 
 		// Start writing to temp file if exceeds threshold
-		if (totalBytes > DEFAULT_MAX_BYTES && !tempFilePath) {
-			const id = randomBytes(8).toString("hex");
-			tempFilePath = join(tmpdir(), `pi-bash-${id}.log`);
-			tempFileStream = createWriteStream(tempFilePath);
-			for (const chunk of outputChunks) {
-				tempFileStream.write(chunk);
-			}
+		if (totalBytes > DEFAULT_MAX_BYTES) {
+			ensureTempFile();
 		}
 
 		if (tempFileStream) {
@@ -126,6 +116,9 @@ export async function executeBashWithOperations(
 
 		const fullOutput = outputChunks.join("");
 		const truncationResult = truncateTail(fullOutput);
+		if (truncationResult.truncated) {
+			ensureTempFile();
+		}
 		const cancelled = options?.signal?.aborted ?? false;
 
 		return {
@@ -144,6 +137,9 @@ export async function executeBashWithOperations(
 		if (options?.signal?.aborted) {
 			const fullOutput = outputChunks.join("");
 			const truncationResult = truncateTail(fullOutput);
+			if (truncationResult.truncated) {
+				ensureTempFile();
+			}
 			return {
 				output: truncationResult.truncated ? truncationResult.content : fullOutput,
 				exitCode: undefined,

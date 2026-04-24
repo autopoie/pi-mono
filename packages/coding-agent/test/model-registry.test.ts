@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, Context, Model, OpenAICompletionsCompat } from "@mariozechner/pi-ai";
+import type { AnthropicMessagesCompat, Api, Context, Model, OpenAICompletionsCompat } from "@mariozechner/pi-ai";
 import { getApiProvider } from "@mariozechner/pi-ai";
 import { getOAuthProvider } from "@mariozechner/pi-ai/oauth";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
@@ -135,6 +135,28 @@ describe("ModelRegistry", () => {
 			}
 		});
 
+		test("headers-only override resolves at request time", async () => {
+			writeRawModelsJson({
+				anthropic: {
+					headers: {
+						"X-Custom-Header": "custom-value",
+					},
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.getError()).toBeUndefined();
+			const anthropicModels = getModelsForProvider(registry, "anthropic");
+
+			for (const model of anthropicModels) {
+				const auth = await registry.getApiKeyAndHeaders(model);
+				expect(auth.ok).toBe(true);
+				if (auth.ok) {
+					expect(auth.headers?.["X-Custom-Header"]).toBe("custom-value");
+				}
+			}
+		});
+
 		test("baseUrl-only override does not affect other providers", () => {
 			writeRawModelsJson({
 				anthropic: overrideConfig("https://my-proxy.example.com/v1"),
@@ -192,6 +214,49 @@ describe("ModelRegistry", () => {
 	});
 
 	describe("custom models merge behavior", () => {
+		test("built-in provider custom models inherit api and baseUrl without explicit fields", () => {
+			// Built-in providers already have api/baseUrl on every model, and auth
+			// comes from env vars / auth storage. No need to specify them.
+			writeRawModelsJson({
+				openrouter: {
+					models: [
+						{
+							id: "fake-provider/fake-model",
+							name: "Fake model",
+							reasoning: true,
+							input: ["text"],
+						},
+					],
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.getError()).toBeUndefined();
+
+			const model = registry.find("openrouter", "fake-provider/fake-model");
+			expect(model).toBeDefined();
+			expect(model?.api).toBe("openai-completions");
+			expect(model?.baseUrl).toBe("https://openrouter.ai/api/v1");
+		});
+
+		test("non-built-in provider custom models still require baseUrl and apiKey", () => {
+			writeRawModelsJson({
+				"my-custom-provider": {
+					models: [
+						{
+							id: "my-model",
+							api: "openai-completions",
+							reasoning: false,
+							input: ["text"],
+						},
+					],
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.getError()).toContain("baseUrl");
+		});
+
 		test("custom provider with same name as built-in merges with built-in models", () => {
 			writeModelsJson({
 				anthropic: providerConfig("https://my-proxy.example.com/v1", [{ id: "claude-custom" }]),
@@ -331,7 +396,7 @@ describe("ModelRegistry", () => {
 			}
 		});
 
-		test("compat schema accepts reasoningEffortMap and supportsStrictMode", () => {
+		test("compat schema accepts reasoningEffortMap, supportsStrictMode, and cacheControlFormat", () => {
 			writeRawModelsJson({
 				demo: {
 					baseUrl: "https://example.com/v1",
@@ -351,6 +416,7 @@ describe("ModelRegistry", () => {
 									high: "max",
 								},
 								supportsStrictMode: false,
+								cacheControlFormat: "anthropic",
 							},
 						},
 					],
@@ -363,6 +429,65 @@ describe("ModelRegistry", () => {
 			expect(registry.getError()).toBeUndefined();
 			expect(compat?.reasoningEffortMap).toEqual({ minimal: "default", high: "max" });
 			expect(compat?.supportsStrictMode).toBe(false);
+			expect(compat?.cacheControlFormat).toBe("anthropic");
+		});
+
+		test("compat schema accepts Anthropic eager tool input streaming flag", () => {
+			writeRawModelsJson({
+				demo: {
+					baseUrl: "https://example.com",
+					apiKey: "DEMO_KEY",
+					api: "anthropic-messages",
+					compat: {
+						supportsEagerToolInputStreaming: false,
+					},
+					models: [
+						{
+							id: "demo-model",
+							reasoning: true,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 1000,
+							maxTokens: 100,
+						},
+					],
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const compat = registry.find("demo", "demo-model")?.compat as AnthropicMessagesCompat | undefined;
+
+			expect(registry.getError()).toBeUndefined();
+			expect(compat?.supportsEagerToolInputStreaming).toBe(false);
+		});
+
+		test("compat schema accepts long cache retention flag", () => {
+			writeRawModelsJson({
+				demo: {
+					baseUrl: "https://example.com",
+					apiKey: "DEMO_KEY",
+					api: "anthropic-messages",
+					compat: {
+						supportsLongCacheRetention: false,
+					},
+					models: [
+						{
+							id: "demo-model",
+							reasoning: true,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 1000,
+							maxTokens: 100,
+						},
+					],
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const compat = registry.find("demo", "demo-model")?.compat as AnthropicMessagesCompat | undefined;
+
+			expect(registry.getError()).toBeUndefined();
+			expect(compat?.supportsLongCacheRetention).toBe(false);
 		});
 
 		test("model-level baseUrl overrides provider-level baseUrl for custom models", () => {
