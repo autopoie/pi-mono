@@ -52,6 +52,10 @@ export interface MarkdownSettings {
 	codeBlockIndent?: string; // default: "  "
 }
 
+export interface WarningSettings {
+	anthropicExtraUsage?: boolean; // default: true
+}
+
 export type TransportSetting = Transport;
 
 /**
@@ -74,7 +78,7 @@ export interface Settings {
 	defaultProvider?: string;
 	defaultModel?: string;
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-	transport?: TransportSetting; // default: "sse"
+	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
 	theme?: string;
@@ -104,6 +108,7 @@ export interface Settings {
 	autocompleteMaxVisible?: number; // Max visible items in autocomplete dropdown (default: 5)
 	showHardwareCursor?: boolean; // Show terminal cursor while still positioning it for IME
 	markdown?: MarkdownSettings;
+	warnings?: WarningSettings;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
 }
 
@@ -651,7 +656,7 @@ export class SettingsManager {
 	}
 
 	getTransport(): TransportSetting {
-		return this.settings.transport ?? "sse";
+		return this.settings.transport ?? "auto";
 	}
 
 	setTransport(transport: TransportSetting): void {
@@ -1048,5 +1053,15 @@ export class SettingsManager {
 
 	getCodeBlockIndent(): string {
 		return this.settings.markdown?.codeBlockIndent ?? "  ";
+	}
+
+	getWarnings(): WarningSettings {
+		return { ...(this.settings.warnings ?? {}) };
+	}
+
+	setWarnings(warnings: WarningSettings): void {
+		this.globalSettings.warnings = { ...warnings };
+		this.markModified("warnings");
+		this.save();
 	}
 }

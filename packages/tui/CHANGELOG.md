@@ -1,6 +1,35 @@
 # Changelog
 
-## [Unreleased]
+## [0.73.0] - 2026-05-04
+
+### Fixed
+
+- Fixed fuzzy ranking to prioritize exact matches in selector and autocomplete results.
+
+## [0.72.1] - 2026-05-02
+
+## [0.72.0] - 2026-05-01
+
+## [0.71.1] - 2026-05-01
+
+## [0.71.0] - 2026-04-30
+
+### Fixed
+
+- Fixed `ProcessTerminal` to fall back to `COLUMNS` and `LINES` before defaulting to 80x24 dimensions ([#4004](https://github.com/badlogic/pi-mono/issues/4004))
+- Fixed editor rendering artifacts for Thai Sara Am and Lao AM vowel characters ([#3904](https://github.com/badlogic/pi-mono/issues/3904))
+
+## [0.70.6] - 2026-04-28
+
+## [0.70.5] - 2026-04-27
+
+## [0.70.4] - 2026-04-27
+
+## [0.70.3] - 2026-04-27
+
+### Fixed
+
+- Fixed duplicate printable characters from Kitty keyboard protocol CSI-u plus raw character input on layouts such as Italian ([#3780](https://github.com/badlogic/pi-mono/issues/3780))
 
 ## [0.70.2] - 2026-04-24
 
