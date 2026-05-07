@@ -801,17 +801,18 @@ export class SessionManager {
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
-		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-		if (!hasAssistant) {
-			// Mark as not flushed so when assistant arrives, all entries get written
+		const hasPersistableConversationMessage = this.fileEntries.some(
+			(e) => (e.type === "message" && e.message.role === "assistant") || e.type === "custom_message",
+		);
+		if (!hasPersistableConversationMessage) {
+			// Mark as not flushed so when a persistable conversation message arrives,
+			// all prior entries get written to disk together.
 			this.flushed = false;
 			return;
 		}
 
 		if (!this.flushed) {
-			for (const e of this.fileEntries) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(e)}\n`);
-			}
+			this._rewriteFile();
 			this.flushed = true;
 		} else {
 			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
@@ -1224,13 +1225,15 @@ export class SessionManager {
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
 
-			// Only write the file now if it contains an assistant message.
+			// Only write the file now if it contains a persistable conversation message.
 			// Otherwise defer to _persist(), which creates the file on the
-			// first assistant response, matching the newSession() contract
-			// and avoiding the duplicate-header bug when _persist()'s
-			// no-assistant guard later resets flushed to false.
-			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-			if (hasAssistant) {
+			// first assistant or custom_message entry, matching the newSession()
+			// contract and avoiding the duplicate-header bug when _persist()'s
+			// guard later resets flushed to false.
+			const hasPersistableConversationMessage = this.fileEntries.some(
+				(e) => (e.type === "message" && e.message.role === "assistant") || e.type === "custom_message",
+			);
+			if (hasPersistableConversationMessage) {
 				this._rewriteFile();
 				this.flushed = true;
 			} else {
