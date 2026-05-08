@@ -388,7 +388,7 @@ async function initializeRunner({
 		followUpMode: settingsManager.getFollowUpMode(),
 		transport: settingsManager.getTransport(),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
-		maxRetryDelayMs: settingsManager.getRetrySettings().maxDelayMs,
+		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 	});
 
 	const loadedSession = sessionManager.buildSessionContext();

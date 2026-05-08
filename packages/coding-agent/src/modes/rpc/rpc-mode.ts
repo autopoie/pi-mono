@@ -12,13 +12,15 @@
  */
 
 import * as crypto from "node:crypto";
-import type { AgentSessionRuntimeHost } from "../../core/agent-session-runtime.js";
+import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
+	WorkingIndicatorOptions,
 } from "../../core/extensions/index.js";
 import { takeOverStdout, writeRawStdout } from "../../core/output-guard.js";
+import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { type Theme, theme } from "../interactive/theme/theme.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
 import type {
@@ -43,7 +45,7 @@ export type {
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
-export async function runRpcMode(runtimeHost: AgentSessionRuntimeHost): Promise<never> {
+export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<never> {
 	takeOverStdout();
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
@@ -75,6 +77,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntimeHost): Promise<
 
 	// Shutdown request flag
 	let shutdownRequested = false;
+	let shuttingDown = false;
+	const signalCleanupHandlers: Array<() => void> = [];
 
 	/** Helper for dialog methods with signal/timeout support */
 	function createDialogPromise<T>(
@@ -169,6 +173,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntimeHost): Promise<
 			// Working message not supported in RPC mode - requires TUI loader access
 		},
 
+		setWorkingVisible(_visible: boolean): void {
+			// Working visibility not supported in RPC mode - requires TUI loader access
+		},
+
+		setWorkingIndicator(_options?: WorkingIndicatorOptions): void {
+			// Working indicator customization not supported in RPC mode - requires TUI loader access
+		},
+
 		setHiddenThinkingLabel(_label?: string): void {
 			// Hidden thinking label not supported in RPC mode - requires TUI message rendering access
 		},
@@ -251,8 +263,17 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntimeHost): Promise<
 			});
 		},
 
+		addAutocompleteProvider(): void {
+			// Autocomplete provider composition is not supported in RPC mode
+		},
+
 		setEditorComponent(): void {
 			// Custom editor components not supported in RPC mode
+		},
+
+		getEditorComponent() {
+			// Custom editor components not supported in RPC mode
+			return undefined;
 		},
 
 		get theme() {
@@ -282,24 +303,19 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntimeHost): Promise<
 		},
 	});
 
+	runtimeHost.setRebindSession(async () => {
+		await rebindSession();
+	});
+
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
 		await session.bindExtensions({
 			uiContext: createExtensionUIContext(),
 			commandContextActions: {
 				waitForIdle: () => session.agent.waitForIdle(),
-				newSession: async (options) => {
-					const result = await runtimeHost.newSession(options);
-					if (!result.cancelled) {
-						await rebindSession();
-					}
-					return result;
-				},
-				fork: async (entryId) => {
-					const result = await runtimeHost.fork(entryId);
-					if (!result.cancelled) {
-						await rebindSession();
-					}
+				newSession: async (options) => runtimeHost.newSession(options),
+				fork: async (entryId, forkOptions) => {
+					const result = await runtimeHost.fork(entryId, forkOptions);
 					return { cancelled: result.cancelled };
 				},
 				navigateTree: async (targetId, options) => {
@@ -311,12 +327,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntimeHost): Promise<
 					});
 					return { cancelled: result.cancelled };
 				},
-				switchSession: async (sessionPath) => {
-					const result = await runtimeHost.switchSession(sessionPath);
-					if (!result.cancelled) {
-						await rebindSession();
-					}
-					return result;
+				switchSession: async (sessionPath, options) => {
+					return runtimeHost.switchSession(sessionPath, options);
 				},
 				reload: async () => {
 					await session.reload();
@@ -336,10 +348,27 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntimeHost): Promise<
 		});
 	};
 
+	const registerSignalHandlers = (): void => {
+		const signals: NodeJS.Signals[] = ["SIGTERM"];
+		if (process.platform !== "win32") {
+			signals.push("SIGHUP");
+		}
+
+		for (const signal of signals) {
+			const handler = () => {
+				killTrackedDetachedChildren();
+				void shutdown(signal === "SIGHUP" ? 129 : 143);
+			};
+			process.on(signal, handler);
+			signalCleanupHandlers.push(() => process.off(signal, handler));
+		}
+	};
+
 	await rebindSession();
+	registerSignalHandlers();
 
 	// Handle a single command
-	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
+	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
 		const id = command.id;
 
 		switch (command.type) {
@@ -348,17 +377,27 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntimeHost): Promise<
 			// =================================================================
 
 			case "prompt": {
-				// Don't await - events will stream
-				// Extension commands are executed immediately, file prompt templates are expanded
-				// If streaming and streamingBehavior specified, queues via steer/followUp
-				session
+				// Start prompt handling immediately, but emit the authoritative response only after
+				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
+				let preflightSucceeded = false;
+				void session
 					.prompt(command.message, {
 						images: command.images,
 						streamingBehavior: command.streamingBehavior,
 						source: "rpc",
+						preflightResult: (didSucceed) => {
+							if (didSucceed) {
+								preflightSucceeded = true;
+								output(success(id, "prompt"));
+							}
+						},
 					})
-					.catch((e) => output(error(id, "prompt", e.message)));
-				return success(id, "prompt");
+					.catch((e) => {
+						if (!preflightSucceeded) {
+							output(error(id, "prompt", e.message));
+						}
+					});
+				return undefined;
 			}
 
 			case "steer": {
@@ -537,6 +576,18 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntimeHost): Promise<
 				return success(id, "fork", { text: result.selectedText, cancelled: result.cancelled });
 			}
 
+			case "clone": {
+				const leafId = session.sessionManager.getLeafId();
+				if (!leafId) {
+					return error(id, "clone", "Cannot clone session: no current entry selected");
+				}
+				const result = await runtimeHost.fork(leafId, { position: "at" });
+				if (!result.cancelled) {
+					await rebindSession();
+				}
+				return success(id, "clone", { cancelled: result.cancelled });
+			}
+
 			case "get_fork_messages": {
 				const messages = session.getUserMessagesForForking();
 				return success(id, "get_fork_messages", { messages });
@@ -571,7 +622,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntimeHost): Promise<
 			case "get_commands": {
 				const commands: RpcSlashCommand[] = [];
 
-				for (const command of session.extensionRunner?.getRegisteredCommands() ?? []) {
+				for (const command of session.extensionRunner.getRegisteredCommands()) {
 					commands.push({
 						name: command.invocationName,
 						description: command.description,
@@ -614,12 +665,19 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntimeHost): Promise<
 	 */
 	let detachInput = () => {};
 
-	async function shutdown(): Promise<never> {
+	async function shutdown(exitCode = 0): Promise<never> {
+		if (shuttingDown) {
+			process.exit(exitCode);
+		}
+		shuttingDown = true;
+		for (const cleanup of signalCleanupHandlers) {
+			cleanup();
+		}
 		unsubscribe?.();
 		await runtimeHost.dispose();
 		detachInput();
 		process.stdin.pause();
-		process.exit(0);
+		process.exit(exitCode);
 	}
 
 	async function checkShutdownRequested(): Promise<void> {
@@ -628,29 +686,51 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntimeHost): Promise<
 	}
 
 	const handleInputLine = async (line: string) => {
+		let parsed: unknown;
 		try {
-			const parsed = JSON.parse(line);
+			parsed = JSON.parse(line);
+		} catch (parseError: unknown) {
+			output(
+				error(
+					undefined,
+					"parse",
+					`Failed to parse command: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
+				),
+			);
+			return;
+		}
 
-			// Handle extension UI responses
-			if (parsed.type === "extension_ui_response") {
-				const response = parsed as RpcExtensionUIResponse;
-				const pending = pendingExtensionRequests.get(response.id);
-				if (pending) {
-					pendingExtensionRequests.delete(response.id);
-					pending.resolve(response);
-				}
-				return;
+		// Handle extension UI responses
+		if (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			"type" in parsed &&
+			parsed.type === "extension_ui_response"
+		) {
+			const response = parsed as RpcExtensionUIResponse;
+			const pending = pendingExtensionRequests.get(response.id);
+			if (pending) {
+				pendingExtensionRequests.delete(response.id);
+				pending.resolve(response);
 			}
+			return;
+		}
 
-			// Handle regular commands
-			const command = parsed as RpcCommand;
+		const command = parsed as RpcCommand;
+		try {
 			const response = await handleCommand(command);
-			output(response);
-
-			// Check for deferred shutdown request (idle between commands)
+			if (response) {
+				output(response);
+			}
 			await checkShutdownRequested();
-		} catch (e: any) {
-			output(error(undefined, "parse", `Failed to parse command: ${e.message}`));
+		} catch (commandError: unknown) {
+			output(
+				error(
+					command.id,
+					command.type,
+					commandError instanceof Error ? commandError.message : String(commandError),
+				),
+			);
 		}
 	};
 

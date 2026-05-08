@@ -4,9 +4,10 @@ import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@mariozechner/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-	type AgentSessionRuntimeBootstrap,
-	AgentSessionRuntimeHost,
+	type CreateAgentSessionRuntimeFactory,
+	createAgentSessionFromServices,
 	createAgentSessionRuntime,
+	createAgentSessionServices,
 } from "../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { SessionManager } from "../src/core/session-manager.js";
@@ -14,12 +15,17 @@ import type {
 	ExtensionFactory,
 	SessionBeforeForkEvent,
 	SessionBeforeSwitchEvent,
+	SessionShutdownEvent,
 	SessionStartEvent,
 } from "../src/index.js";
 
-type RecordedSessionEvent = SessionBeforeSwitchEvent | SessionBeforeForkEvent | SessionStartEvent;
+type RecordedSessionEvent =
+	| SessionBeforeSwitchEvent
+	| SessionBeforeForkEvent
+	| SessionShutdownEvent
+	| SessionStartEvent;
 
-describe("AgentSessionRuntimeHost session lifecycle events", () => {
+describe("AgentSessionRuntime session lifecycle events", () => {
 	const cleanups: Array<() => Promise<void> | void> = [];
 
 	afterEach(async () => {
@@ -38,28 +44,43 @@ describe("AgentSessionRuntimeHost session lifecycle events", () => {
 		const authStorage = AuthStorage.inMemory();
 		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
 
-		const bootstrap: AgentSessionRuntimeBootstrap = {
+		const runtimeOptions = {
 			agentDir: tempDir,
 			authStorage,
 			model: faux.getModel(),
-			resourceLoader: {
+			resourceLoaderOptions: {
 				extensionFactories: [extensionFactory],
 				noSkills: true,
 				noPromptTemplates: true,
 				noThemes: true,
 			},
 		};
-		const runtime = await createAgentSessionRuntime(bootstrap, {
+		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
+			const services = await createAgentSessionServices({
+				...runtimeOptions,
+				cwd,
+			});
+			return {
+				...(await createAgentSessionFromServices({
+					services,
+					sessionManager,
+					sessionStartEvent,
+					model: faux.getModel(),
+				})),
+				services,
+				diagnostics: services.diagnostics,
+			};
+		};
+		const runtimeHost = await createAgentSessionRuntime(createRuntime, {
 			cwd: tempDir,
+			agentDir: tempDir,
 			sessionManager: SessionManager.create(tempDir),
 		});
-		const runtimeHost = new AgentSessionRuntimeHost(bootstrap, runtime);
 		await runtimeHost.session.bindExtensions({});
 
 		cleanups.push(async () => {
 			await runtimeHost.dispose();
 			faux.unregister();
-			process.chdir(tmpdir());
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true });
 			}
@@ -72,6 +93,9 @@ describe("AgentSessionRuntimeHost session lifecycle events", () => {
 		const events: RecordedSessionEvent[] = [];
 		const { runtimeHost } = await createRuntimeHost((pi) => {
 			pi.on("session_before_switch", (event) => {
+				events.push(event);
+			});
+			pi.on("session_shutdown", (event) => {
 				events.push(event);
 			});
 			pi.on("session_start", (event) => {
@@ -89,13 +113,14 @@ describe("AgentSessionRuntimeHost session lifecycle events", () => {
 		const newSessionResult = await runtimeHost.newSession();
 		expect(newSessionResult.cancelled).toBe(false);
 		await runtimeHost.session.bindExtensions({});
+		const secondSessionFile = runtimeHost.session.sessionFile;
 		expect(events).toEqual([
 			{ type: "session_before_switch", reason: "new", targetSessionFile: undefined },
+			{ type: "session_shutdown", reason: "new", targetSessionFile: secondSessionFile },
 			{ type: "session_start", reason: "new", previousSessionFile: originalSessionFile },
 		]);
 
 		events.length = 0;
-		const secondSessionFile = runtimeHost.session.sessionFile;
 		expect(secondSessionFile).toBeTruthy();
 
 		const switchResult = await runtimeHost.switchSession(originalSessionFile!);
@@ -103,6 +128,7 @@ describe("AgentSessionRuntimeHost session lifecycle events", () => {
 		await runtimeHost.session.bindExtensions({});
 		expect(events).toEqual([
 			{ type: "session_before_switch", reason: "resume", targetSessionFile: originalSessionFile },
+			{ type: "session_shutdown", reason: "resume", targetSessionFile: originalSessionFile },
 			{ type: "session_start", reason: "resume", previousSessionFile: secondSessionFile },
 		]);
 	});
@@ -131,6 +157,32 @@ describe("AgentSessionRuntimeHost session lifecycle events", () => {
 		expect(events).toEqual([{ type: "session_before_switch", reason: "new", targetSessionFile: undefined }]);
 	});
 
+	it("runs beforeSessionInvalidate after session_shutdown and before rebindSession", async () => {
+		const phases: string[] = [];
+		const { runtimeHost } = await createRuntimeHost((pi) => {
+			pi.on("session_shutdown", () => {
+				phases.push("session_shutdown");
+			});
+		});
+		const oldSession = runtimeHost.session;
+		runtimeHost.setBeforeSessionInvalidate(() => {
+			phases.push("beforeSessionInvalidate");
+			expect(oldSession.extensionRunner.createContext().cwd).toBe(oldSession.sessionManager.getCwd());
+		});
+		runtimeHost.setRebindSession(async () => {
+			phases.push("rebindSession");
+		});
+
+		await runtimeHost.newSession();
+
+		expect(phases).toEqual(["session_shutdown", "beforeSessionInvalidate", "rebindSession"]);
+		expect(() => oldSession.extensionRunner.createContext().cwd).toThrow(
+			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+		);
+		runtimeHost.setBeforeSessionInvalidate(undefined);
+		runtimeHost.setRebindSession(undefined);
+	});
+
 	it("emits session_before_fork and session_start and honors cancellation", async () => {
 		const events: RecordedSessionEvent[] = [];
 		let cancelNextFork = false;
@@ -141,6 +193,9 @@ describe("AgentSessionRuntimeHost session lifecycle events", () => {
 					cancelNextFork = false;
 					return { cancel: true };
 				}
+			});
+			pi.on("session_shutdown", (event) => {
+				events.push(event);
 			});
 			pi.on("session_start", (event) => {
 				events.push(event);
@@ -159,7 +214,8 @@ describe("AgentSessionRuntimeHost session lifecycle events", () => {
 		expect(successResult.selectedText).toBe("hello");
 		await runtimeHost.session.bindExtensions({});
 		expect(events).toEqual([
-			{ type: "session_before_fork", entryId: userMessage.entryId },
+			{ type: "session_before_fork", entryId: userMessage.entryId, position: "before" },
+			{ type: "session_shutdown", reason: "fork", targetSessionFile: runtimeHost.session.sessionFile },
 			{ type: "session_start", reason: "fork", previousSessionFile },
 		]);
 
@@ -167,6 +223,12 @@ describe("AgentSessionRuntimeHost session lifecycle events", () => {
 		cancelNextFork = true;
 		const cancelResult = await runtimeHost.fork(userMessage.entryId);
 		expect(cancelResult).toEqual({ cancelled: true });
-		expect(events).toEqual([{ type: "session_before_fork", entryId: userMessage.entryId }]);
+		expect(events).toEqual([{ type: "session_before_fork", entryId: userMessage.entryId, position: "before" }]);
+
+		events.length = 0;
+		cancelNextFork = true;
+		const cancelAtResult = await runtimeHost.fork("missing-entry", { position: "at" });
+		expect(cancelAtResult).toEqual({ cancelled: true });
+		expect(events).toEqual([{ type: "session_before_fork", entryId: "missing-entry", position: "at" }]);
 	});
 });

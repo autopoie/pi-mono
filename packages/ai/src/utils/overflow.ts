@@ -9,6 +9,7 @@ import type { AssistantMessage } from "../types.js";
  * Provider-specific patterns (with example error messages):
  *
  * - Anthropic: "prompt is too long: 213462 tokens > 200000 maximum"
+ * - Anthropic: "413 {\"error\":{\"type\":\"request_too_large\",\"message\":\"Request exceeds the maximum size\"}}"
  * - OpenAI: "Your input exceeds the context window of this model"
  * - Google: "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)"
  * - xAI: "This model's maximum prompt length is 131072 but the request contains 537812 tokens"
@@ -22,10 +23,14 @@ import type { AssistantMessage } from "../types.js";
  * - Cerebras: "400/413 status code (no body)"
  * - Mistral: "Prompt contains X tokens ... too large for model with Y maximum context length"
  * - z.ai: Does NOT error, accepts overflow silently - handled via usage.input > contextWindow
+ * - Xiaomi MiMo: Truncates input to fill contextWindow exactly, then returns finish_reason "length"
+ *   with output=0 (no room left to generate). Detected via stopReason "length" + zero output +
+ *   input filling the context window.
  * - Ollama: Some deployments truncate silently, others return errors like "prompt too long; exceeded max context length by X tokens"
  */
 const OVERFLOW_PATTERNS = [
-	/prompt is too long/i, // Anthropic
+	/prompt is too long/i, // Anthropic token overflow
+	/request_too_large/i, // Anthropic request byte-size overflow (HTTP 413)
 	/input is too long for requested model/i, // Amazon Bedrock
 	/exceeds the context window/i, // OpenAI (Completions & Responses API)
 	/input token count.*exceeds the maximum/i, // Google (Gemini)
@@ -73,7 +78,7 @@ const NON_OVERFLOW_PATTERNS = [
  * ## Reliability by Provider
  *
  * **Reliable detection (returns error with detectable message):**
- * - Anthropic: "prompt is too long: X tokens > Y maximum"
+ * - Anthropic: "prompt is too long: X tokens > Y maximum" or "request_too_large"
  * - OpenAI (Completions & Responses): "exceeds the context window"
  * - Google Gemini: "input token count exceeds the maximum"
  * - xAI (Grok): "maximum prompt length is X but request contains Y"
@@ -88,6 +93,8 @@ const NON_OVERFLOW_PATTERNS = [
  * **Unreliable detection:**
  * - z.ai: Sometimes accepts overflow silently (detectable via usage.input > contextWindow),
  *   sometimes returns rate limit errors. Pass contextWindow param to detect silent overflow.
+ * - Xiaomi MiMo: Truncates input to fit contextWindow then returns stopReason "length" with
+ *   output=0. Pass contextWindow param to detect via the "filled context + zero output" signal.
  * - Ollama: May truncate input silently for some setups, but may also return explicit
  *   overflow errors that match the patterns above. Silent truncation still cannot be
  *   detected here because we do not know the expected token count.
@@ -121,6 +128,16 @@ export function isContextOverflow(message: AssistantMessage, contextWindow?: num
 	if (contextWindow && message.stopReason === "stop") {
 		const inputTokens = message.usage.input + message.usage.cacheRead;
 		if (inputTokens > contextWindow) {
+			return true;
+		}
+	}
+
+	// Case 3: Length-stop overflow (Xiaomi MiMo style) - server truncates oversized input
+	// to fit the context window, leaving no room for output. Returns stopReason "length"
+	// with output=0 and input+cacheRead filling the context window.
+	if (contextWindow && message.stopReason === "length" && message.usage.output === 0) {
+		const inputTokens = message.usage.input + message.usage.cacheRead;
+		if (inputTokens >= contextWindow * 0.99) {
 			return true;
 		}
 	}
