@@ -1,24 +1,36 @@
 import { type ChildProcess, type ChildProcessByStdio, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import {
-	existsSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	realpathSync,
-	rmSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+
+function getEnv(): NodeJS.ProcessEnv {
+	if (process.platform !== "linux" || Object.keys(process.env).length > 0) {
+		return process.env;
+	}
+	try {
+		const data = readFileSync("/proc/self/environ", "utf-8");
+		const env: NodeJS.ProcessEnv = {};
+		for (const entry of data.split("\0")) {
+			const idx = entry.indexOf("=");
+			if (idx > 0) {
+				env[entry.slice(0, idx)] = entry.slice(idx + 1);
+			}
+		}
+		return env;
+	} catch {
+		return process.env;
+	}
+}
+
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import { globSync } from "glob";
 import ignore from "ignore";
 import { minimatch } from "minimatch";
 import { CONFIG_DIR_NAME } from "../config.js";
+import { shouldUseWindowsShell } from "../utils/child-process.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
-import { isLocalPath } from "../utils/paths.js";
+import { canonicalizePath, isLocalPath } from "../utils/paths.js";
 import { isStdoutTakenOver } from "./output-guard.js";
 import type { PackageSource, SettingsManager } from "./settings-manager.js";
 
@@ -1832,8 +1844,13 @@ export class DefaultPackageManager implements PackageManager {
 		if (this.globalNpmRoot && this.globalNpmRootCommandKey === commandKey) {
 			return this.globalNpmRoot;
 		}
-		const result = this.runNpmCommandSync(["root", "-g"]);
-		this.globalNpmRoot = result.trim();
+		const isBunPackageManager = npmCommand.command === "bun";
+		if (isBunPackageManager) {
+			const binDir = this.runNpmCommandSync(["pm", "bin", "-g"]).trim();
+			this.globalNpmRoot = join(dirname(binDir), "install", "global", "node_modules");
+		} else {
+			this.globalNpmRoot = this.runNpmCommandSync(["root", "-g"]).trim();
+		}
 		this.globalNpmRootCommandKey = commandKey;
 		return this.globalNpmRoot;
 	}
@@ -2286,65 +2303,39 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private toResolvedPaths(accumulator: ResourceAccumulator): ResolvedPaths {
-		const toResolved = (entries: Map<string, { metadata: PathMetadata; enabled: boolean }>): ResolvedResource[] => {
+		const mapToResolved = (
+			entries: Map<string, { metadata: PathMetadata; enabled: boolean }>,
+		): ResolvedResource[] => {
 			const resolved = Array.from(entries.entries()).map(([path, { metadata, enabled }]) => ({
 				path,
 				enabled,
 				metadata,
 			}));
 			resolved.sort((a, b) => resourcePrecedenceRank(a.metadata) - resourcePrecedenceRank(b.metadata));
-			return resolved;
+
+			const seen = new Set<string>();
+			return resolved.filter((entry) => {
+				const canonicalPath = canonicalizePath(entry.path);
+				if (seen.has(canonicalPath)) return false;
+				seen.add(canonicalPath);
+				return true;
+			});
 		};
-
-		const seenCanonicalSkillPaths = new Set<string>();
-		const resolvedSkills = toResolved(accumulator.skills).filter((entry) => {
-			let canonicalPath: string;
-			try {
-				// Resolve symlink aliases to detect duplicate files.
-				canonicalPath = realpathSync(entry.path);
-			} catch {
-				// Fallback to raw path to match loadSkills() behavior.
-				canonicalPath = entry.path;
-			}
-
-			if (seenCanonicalSkillPaths.has(canonicalPath)) {
-				return false;
-			}
-
-			seenCanonicalSkillPaths.add(canonicalPath);
-			return true;
-		});
 
 		return {
-			extensions: toResolved(accumulator.extensions),
-			skills: resolvedSkills,
-			prompts: toResolved(accumulator.prompts),
-			themes: toResolved(accumulator.themes),
+			extensions: mapToResolved(accumulator.extensions),
+			skills: mapToResolved(accumulator.skills),
+			prompts: mapToResolved(accumulator.prompts),
+			themes: mapToResolved(accumulator.themes),
 		};
-	}
-
-	private shouldUseWindowsShell(command: string): boolean {
-		if (process.platform !== "win32") {
-			return false;
-		}
-		const commandName = basename(command).toLowerCase();
-		return (
-			commandName === "npm" ||
-			commandName === "npx" ||
-			commandName === "pnpm" ||
-			commandName === "yarn" ||
-			commandName === "yarnpkg" ||
-			commandName === "corepack" ||
-			commandName.endsWith(".cmd") ||
-			commandName.endsWith(".bat")
-		);
 	}
 
 	private spawnCommand(command: string, args: string[], options?: { cwd?: string }): ChildProcess {
 		return spawn(command, args, {
 			cwd: options?.cwd,
 			stdio: isStdoutTakenOver() ? ["ignore", 2, 2] : "inherit",
-			shell: this.shouldUseWindowsShell(command),
+			shell: shouldUseWindowsShell(command),
+			env: getEnv(),
 		});
 	}
 
@@ -2353,11 +2344,12 @@ export class DefaultPackageManager implements PackageManager {
 		args: string[],
 		options?: { cwd?: string; env?: Record<string, string> },
 	): ChildProcessByStdio<null, Readable, Readable> {
+		const baseEnv = getEnv();
 		return spawn(command, args, {
 			cwd: options?.cwd,
 			stdio: ["ignore", "pipe", "pipe"],
-			shell: this.shouldUseWindowsShell(command),
-			env: options?.env ? { ...process.env, ...options.env } : process.env,
+			shell: shouldUseWindowsShell(command),
+			env: options?.env ? { ...baseEnv, ...options.env } : baseEnv,
 		});
 	}
 
@@ -2423,10 +2415,13 @@ export class DefaultPackageManager implements PackageManager {
 		const result = spawnSync(command, args, {
 			stdio: ["ignore", "pipe", "pipe"],
 			encoding: "utf-8",
-			shell: this.shouldUseWindowsShell(command),
+			shell: shouldUseWindowsShell(command),
+			env: getEnv(),
 		});
-		if (result.status !== 0) {
-			throw new Error(`Failed to run ${command} ${args.join(" ")}: ${result.stderr || result.stdout}`);
+		if (result.error || result.status !== 0) {
+			throw new Error(
+				`Failed to run ${command} ${args.join(" ")}: ${result.error?.message || result.stderr || result.stdout}`,
+			);
 		}
 		return (result.stdout || result.stderr || "").trim();
 	}
