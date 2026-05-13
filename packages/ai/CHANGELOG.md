@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed GitHub Copilot Claude test coverage to use the current Claude Sonnet 4.6 model ID.
+
 ## [0.73.0] - 2026-05-04
 
 ### Breaking Changes
