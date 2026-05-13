@@ -22,6 +22,7 @@ import {
 	type SlackContext,
 	type SlackEvent,
 } from "./slack.js";
+import { SlackHttpIngress } from "./slack-http.js";
 import {
 	MAX_MAIN_MESSAGE_LENGTH,
 	MAX_THREAD_MESSAGE_LENGTH,
@@ -34,6 +35,7 @@ import { ChannelStore } from "./store.js";
 
 const MOM_SLACK_APP_TOKEN = process.env.MOM_SLACK_APP_TOKEN;
 const MOM_SLACK_BOT_TOKEN = process.env.MOM_SLACK_BOT_TOKEN;
+const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 
 interface ParsedArgs {
 	workingDir?: string;
@@ -58,6 +60,48 @@ interface ChannelExecutionState {
 	stopMessageTs?: string;
 	stopStatusRequestId?: number;
 	stopStatusPromise?: Promise<string | undefined>;
+}
+
+type SlackIngressMode = "socket" | "http";
+
+interface SlackIngress {
+	start(): Promise<void>;
+	stop(): Promise<void>;
+}
+
+function parseSlackIngressMode(value: string | undefined): SlackIngressMode {
+	if (!value || value === "socket") {
+		return "socket";
+	}
+	if (value === "http") {
+		return "http";
+	}
+	throw new Error("MOM_SLACK_INGRESS_MODE must be 'socket' or 'http'");
+}
+
+function parseHttpPort(value: string | undefined): number {
+	const rawPort = value ?? "3000";
+	const port = Number.parseInt(rawPort, 10);
+	if (!Number.isInteger(port) || port <= 0 || port > 65535 || port.toString() !== rawPort) {
+		throw new Error("PORT must be an integer from 1 to 65535");
+	}
+	return port;
+}
+
+function parseEventsPath(value: string | undefined): string {
+	const path = value?.trim() || "/slack/events";
+	if (!path.startsWith("/")) {
+		throw new Error("MOM_SLACK_EVENTS_PATH must start with '/'");
+	}
+	return path;
+}
+
+function parseAllowedTeamIds(value: string | undefined): ReadonlySet<string> | undefined {
+	const teamIds = value
+		?.split(",")
+		.map((teamId) => teamId.trim())
+		.filter(Boolean);
+	return teamIds && teamIds.length > 0 ? new Set(teamIds) : undefined;
 }
 
 function parseArgs(): ParsedArgs {
@@ -108,8 +152,32 @@ if (!parsedArgs.workingDir) {
 const workingDir = parsedArgs.workingDir;
 const sandbox = parsedArgs.sandbox;
 
-if (!MOM_SLACK_APP_TOKEN || !MOM_SLACK_BOT_TOKEN) {
-	console.error("Missing env: MOM_SLACK_APP_TOKEN, MOM_SLACK_BOT_TOKEN");
+let ingressMode: SlackIngressMode;
+let httpPort = 3000;
+let httpEventsPath = "/slack/events";
+let allowedTeamIds: ReadonlySet<string> | undefined;
+try {
+	ingressMode = parseSlackIngressMode(process.env.MOM_SLACK_INGRESS_MODE);
+	if (ingressMode === "http") {
+		httpPort = parseHttpPort(process.env.PORT);
+		httpEventsPath = parseEventsPath(process.env.MOM_SLACK_EVENTS_PATH);
+		allowedTeamIds = parseAllowedTeamIds(process.env.MOM_SLACK_ALLOWED_TEAM_IDS);
+	}
+} catch (error) {
+	console.error(error instanceof Error ? error.message : String(error));
+	process.exit(1);
+}
+
+if (!MOM_SLACK_BOT_TOKEN) {
+	console.error("Missing env: MOM_SLACK_BOT_TOKEN");
+	process.exit(1);
+}
+if (ingressMode === "socket" && !MOM_SLACK_APP_TOKEN) {
+	console.error("Missing env: MOM_SLACK_APP_TOKEN");
+	process.exit(1);
+}
+if (ingressMode === "http" && !SLACK_SIGNING_SECRET) {
+	console.error("Missing env: SLACK_SIGNING_SECRET");
 	process.exit(1);
 }
 
@@ -277,6 +345,7 @@ function createSlackContext(
 			ts: event.ts,
 			threadTs: conversationThreadRootTs ?? event.threadTs,
 			attachments: (event.attachments || []).map((attachment) => ({ local: attachment.local })),
+			slack: event.metadata,
 		},
 		channelName: slack.getChannel(event.channel)?.name,
 		isEvent,
@@ -429,25 +498,34 @@ const handler: MomHandler = {
 
 const sharedStore = new ChannelStore({ workingDir, botToken: MOM_SLACK_BOT_TOKEN! });
 const bot = new SlackBotClass(handler, {
-	appToken: MOM_SLACK_APP_TOKEN,
 	botToken: MOM_SLACK_BOT_TOKEN,
 	workingDir,
 	store: sharedStore,
 });
+const ingress: SlackIngress =
+	ingressMode === "socket"
+		? {
+				start: () => bot.startSocketMode(MOM_SLACK_APP_TOKEN!),
+				stop: () => bot.stopSocketMode(),
+			}
+		: new SlackHttpIngress({
+				bot,
+				signingSecret: SLACK_SIGNING_SECRET!,
+				port: httpPort,
+				eventsPath: httpEventsPath,
+				allowedTeamIds,
+			});
 
 const eventsWatcher = createEventsWatcher(workingDir, bot);
 eventsWatcher.start();
 
-process.on("SIGINT", () => {
+function shutdown(): void {
 	log.logInfo("Shutting down...");
 	eventsWatcher.stop();
-	process.exit(0);
-});
+	void ingress.stop().finally(() => process.exit(0));
+}
 
-process.on("SIGTERM", () => {
-	log.logInfo("Shutting down...");
-	eventsWatcher.stop();
-	process.exit(0);
-});
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
-await bot.start();
+await ingress.start();

@@ -29,9 +29,11 @@ npm install @mariozechner/pi-mom
 
 ### Slack App Setup
 
+Mom can receive Slack events through Socket Mode or Slack's HTTP Events API. Socket Mode is the default.
+
 1. Create a new Slack app at https://api.slack.com/apps
-2. Enable **Socket Mode** (Settings → Socket Mode → Enable)
-3. Generate an **App-Level Token** with `connections:write` scope. This is `MOM_SLACK_APP_TOKEN`
+2. For Socket Mode, enable **Socket Mode** (Settings → Socket Mode → Enable) and generate an **App-Level Token** with `connections:write` scope. This is `MOM_SLACK_APP_TOKEN`
+3. For HTTP mode, enable **Event Subscriptions** and configure the request URL to your public `MOM_SLACK_EVENTS_PATH` endpoint. Copy the app **Signing Secret** as `SLACK_SIGNING_SECRET`
 4. Add **Bot Token Scopes** (OAuth & Permissions):
    - `app_mentions:read`
    - `channels:history`
@@ -60,7 +62,8 @@ npm install @mariozechner/pi-mom
 ## Quick Start
 
 ```bash
-# Set environment variables
+# Set environment variables for Socket Mode (the default)
+export MOM_SLACK_INGRESS_MODE=socket
 export MOM_SLACK_APP_TOKEN=xapp-...
 export MOM_SLACK_BOT_TOKEN=xoxb-...
 
@@ -74,6 +77,15 @@ export OPENAI_API_KEY=sk-...
 export MOM_TRUSTED_EXTENSION_ROOT=/absolute/path/outside/your-workspace
 
 # Or use /login in pi, then copy/link auth.json to ~/.pi/mom/
+
+# Use the HTTP Events API instead of Socket Mode
+export MOM_SLACK_INGRESS_MODE=http
+export MOM_SLACK_BOT_TOKEN=xoxb-...
+export SLACK_SIGNING_SECRET=...
+export PORT=3000
+export MOM_SLACK_EVENTS_PATH=/slack/events
+# Set this if your Slack app might receive events from workspaces other than the one this Mom serves
+export MOM_SLACK_ALLOWED_TEAM_IDS=T123456
 
 # Create Docker sandbox (recommended)
 docker run -d \
@@ -102,8 +114,13 @@ Options:
 
 | Variable | Description |
 |----------|-------------|
-| `MOM_SLACK_APP_TOKEN` | Slack app-level token (xapp-...) |
+| `MOM_SLACK_INGRESS_MODE` | How Mom receives Slack events: `socket` (default) or `http` |
+| `MOM_SLACK_APP_TOKEN` | Slack app-level token (xapp-...); required for Socket Mode |
 | `MOM_SLACK_BOT_TOKEN` | Slack bot token (xoxb-...) |
+| `SLACK_SIGNING_SECRET` | Slack app signing secret; required for HTTP Events API mode |
+| `PORT` | HTTP mode listen port; defaults to `3000` |
+| `MOM_SLACK_EVENTS_PATH` | HTTP mode Slack Events API path; defaults to `/slack/events` |
+| `MOM_SLACK_ALLOWED_TEAM_IDS` | Optional comma-separated Slack team allowlist for HTTP mode. Set this if your Slack app might receive events from workspaces other than the one this Mom serves; if unset, every signed team is accepted |
 | `MOM_MODEL` | Optional startup model in `provider:model` form |
 | Provider API key env vars | Optional provider credentials such as `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` |
 | `MOM_TRUSTED_EXTENSION_ROOT` | Optional absolute trusted extension root outside the workspace; enables strict mode |
@@ -143,7 +160,7 @@ See [docs/extensions.md](docs/extensions.md) for extension discovery, trust sett
 
 ## How Mom Works
 
-Mom is a Node.js app that runs on your host machine. She connects to Slack via Socket Mode, receives messages, and responds using an LLM-based agent that can create and use tools.
+Mom is a Node.js app that runs on your host machine. She receives Slack messages through Socket Mode or the HTTP Events API, then responds using an LLM-based agent that can create and use tools.
 
 **For each DM**, mom maintains one channel-scoped conversation history. **For public and private channels**, mom stores channel assets together and persists a separate conversation session per @mention thread. Execution is serialized per Slack channel because memory, skills, scratch space, uploads, and other mutable workspace state are channel-scoped.
 

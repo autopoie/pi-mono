@@ -887,6 +887,7 @@ function buildRequestContext(ctx: SlackContext): MomRequestContext {
 		rawText: ctx.message.rawText,
 		attachments: ctx.message.attachments.map((attachment) => attachment.local),
 		isEvent: ctx.isEvent ?? false,
+		slack: ctx.message.slack,
 	};
 }
 
