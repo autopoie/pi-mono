@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added Slack HTTP Events API ingress with signed raw-body verification, URL verification, event dedupe, and a `/health` endpoint
 - Added trusted extension loading with strict trusted-root mode, Slack-aware hook bridging, and native `MOM_MODEL=provider:model` startup resolution
 
 ### Changed

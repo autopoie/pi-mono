@@ -1,6 +1,6 @@
-# Minimal Slack Bot Setup (No Web Server, WebSocket Only)
+# Minimal Slack Bot Setup
 
-Here's how to connect your Node.js agent to Slack using **Socket Mode** - no Express, no HTTP server, just WebSockets and callbacks.
+Here's how to connect mom to Slack. Socket Mode uses WebSockets and is the default. HTTP Events API mode uses a public request URL with Slack request signing.
 
 ---
 
@@ -57,7 +57,9 @@ You need **TWO tokens**:
 
 ---
 
-## 3. Enable Socket Mode
+## 3. Choose Slack delivery mode
+
+### Socket Mode
 
 1. Go to https://api.slack.com/apps → select your app
 2. Click **"Socket Mode"** in sidebar
@@ -66,6 +68,28 @@ You need **TWO tokens**:
 5. Done - no webhook URL needed!
 
 **Note:** Socket Mode is intended for internal apps in development or behind a firewall. Not for apps distributed via Slack Marketplace.
+
+---
+
+### HTTP Events API
+
+1. Go to https://api.slack.com/apps → select your app
+2. Click **"Basic Information"** and copy the **Signing Secret**. This is `SLACK_SIGNING_SECRET`
+3. Click **"Event Subscriptions"** in sidebar
+4. Toggle **"Enable Events"** to ON
+5. Set the Request URL to your public mom endpoint, such as `https://example.com/slack/events`. This URL should route to `MOM_SLACK_EVENTS_PATH`
+6. Run mom with:
+
+```bash
+export MOM_SLACK_INGRESS_MODE=http
+export MOM_SLACK_BOT_TOKEN=xoxb-your-bot-token-here
+export SLACK_SIGNING_SECRET=your-signing-secret
+export PORT=3000
+export MOM_SLACK_EVENTS_PATH=/slack/events
+mom ./data
+```
+
+HTTP mode also exposes `GET /health` for load balancers and readiness checks. If `MOM_SLACK_ALLOWED_TEAM_IDS` is unset, Mom accepts every team signed by the configured Slack app. Set `MOM_SLACK_ALLOWED_TEAM_IDS=T123456` if your Slack app might receive events from workspaces other than the one this Mom serves.
 
 ---
 
@@ -84,7 +108,7 @@ You need **TWO tokens**:
 1. Go to https://api.slack.com/apps → select your app
 2. Click **"Event Subscriptions"** in sidebar
 3. Toggle **"Enable Events"** to ON
-4. **Important:** No Request URL needed (Socket Mode handles this)
+4. **Socket Mode:** no Request URL is needed because Socket Mode handles event delivery. **HTTP mode:** use the public Request URL configured in section 3
 5. Expand **"Subscribe to bot events"**
 6. Click **"Add Bot User Event"** and add:
    - `app_mention` (required - to see when bot is mentioned)
@@ -97,11 +121,21 @@ You need **TWO tokens**:
 
 ## 6. Store Tokens
 
-Create `.env` file:
+Create `.env` file.
+
+For Socket Mode:
 
 ```bash
-SLACK_BOT_TOKEN=xoxb-your-bot-token-here
-SLACK_APP_TOKEN=xapp-your-app-token-here
+MOM_SLACK_BOT_TOKEN=xoxb-your-bot-token-here
+MOM_SLACK_APP_TOKEN=xapp-your-app-token-here
+```
+
+For HTTP Events API mode:
+
+```bash
+MOM_SLACK_INGRESS_MODE=http
+MOM_SLACK_BOT_TOKEN=xoxb-your-bot-token-here
+SLACK_SIGNING_SECRET=your-signing-secret
 ```
 
 Add to `.gitignore`:
@@ -369,8 +403,8 @@ Event object structure:
 1. **You MUST call `ack()`** on every event or Slack will retry
 2. **Bot token** (`xoxb-`) is for sending messages
 3. **App token** (`xapp-`) is for receiving events via WebSocket
-4. **Connection is persistent** - your script stays running
-5. **No URL validation** needed (unlike HTTP webhooks)
+4. **Connection is persistent in Socket Mode** - your script stays running
+5. **HTTP mode verifies Slack signatures** using `x-slack-signature` and `x-slack-request-timestamp`
 
 ---
 
@@ -396,4 +430,4 @@ Event object structure:
 
 ---
 
-That's it. No HTTP server bullshit. Just WebSockets and callbacks.
+That's it. Use Socket Mode for private WebSocket ingress, or HTTP Events API mode when Slack needs to deliver events to a public request URL.

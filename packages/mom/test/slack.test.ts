@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,8 +12,9 @@ import {
 	type SlackEvent,
 } from "../src/slack.js";
 
-function flushQueue(): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, 0));
+async function flushQueue(): Promise<void> {
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	await new Promise((resolve) => setTimeout(resolve, 10));
 }
 
 const tempDirs: string[] = [];
@@ -32,6 +33,7 @@ function createSlackBotHarness(params?: {
 	const workingDir = mkdtempSync(join(tmpdir(), "mom-slack-bot-"));
 	tempDirs.push(workingDir);
 	const socketHandlers = new Map<string, (payload: { event: unknown; ack: () => void }) => void>();
+	const processAttachments = vi.fn(() => []);
 	const handleEvent = vi.fn(async (event: SlackEvent) => {
 		await params?.handleEventImpl?.(event);
 	});
@@ -42,11 +44,10 @@ function createSlackBotHarness(params?: {
 			handleStop,
 		},
 		{
-			appToken: "app-token",
 			botToken: "bot-token",
 			workingDir,
 			store: {
-				processAttachments: () => [],
+				processAttachments,
 			} as any,
 		},
 	);
@@ -65,12 +66,180 @@ function createSlackBotHarness(params?: {
 
 	return {
 		bot,
+		workingDir,
 		handleEvent,
 		handleStop,
+		processAttachments,
 		appMentionHandler: socketHandlers.get("app_mention")!,
 		messageHandler: socketHandlers.get("message")!,
 	};
 }
+
+function readSlackHttpPayload(fileName: string): Record<string, unknown> {
+	return JSON.parse(
+		readFileSync(
+			join(process.cwd(), "..", "..", "pi-mom-fixture", "fixtures", "slack-http", "payloads", fileName),
+			"utf8",
+		),
+	) as Record<string, unknown>;
+}
+
+function getPayloadEvent(payload: Record<string, unknown>): Record<string, unknown> {
+	const event = payload.event;
+	if (typeof event !== "object" || event === null) {
+		throw new Error("Fixture payload is missing event object");
+	}
+	return event as Record<string, unknown>;
+}
+
+function dispatchFixturePayload(bot: SlackBot, payload: Record<string, unknown>) {
+	return bot.dispatchSlackCallbackEvent({
+		ingress: "http",
+		event: getPayloadEvent(payload),
+		metadata: {
+			ingress: "http",
+			teamId: payload.team_id as string | undefined,
+			apiAppId: payload.api_app_id as string | undefined,
+			eventId: payload.event_id as string | undefined,
+			eventTime: payload.event_time as number | undefined,
+		},
+	});
+}
+
+describe("mom Slack callback dispatch", () => {
+	it("normalizes HTTP app mentions into channel mention work", async () => {
+		const { bot, handleEvent, workingDir } = createSlackBotHarness();
+		const result = dispatchFixturePayload(bot, readSlackHttpPayload("app-mention.json"));
+		await flushQueue();
+
+		expect(result).toMatchObject({
+			action: "queued",
+			slackEvent: {
+				channel: "C_GROWTH",
+				text: "test-direct-response",
+				type: "mention",
+			},
+			scope: {
+				key: "C_GROWTH:1714492800.000100",
+				threadRootTs: "1714492800.000100",
+			},
+		});
+		expect(handleEvent).toHaveBeenCalledTimes(1);
+		expect(handleEvent.mock.calls[0][0]).toMatchObject({
+			channel: "C_GROWTH",
+			text: "test-direct-response",
+			metadata: {
+				ingress: "http",
+				teamId: "T_KITE_FIXTURE",
+				apiAppId: "A_KITE_SHARED_APP",
+				eventId: "Ev_KITE_FIXTURE_APP_MENTION_001",
+			},
+		});
+
+		const logEntry = JSON.parse(readFileSync(join(workingDir, "C_GROWTH", "log.jsonl"), "utf8"));
+		expect(logEntry).toMatchObject({
+			text: "test-direct-response",
+			threadRootTs: "1714492800.000100",
+			slack: {
+				ingress: "http",
+				teamId: "T_KITE_FIXTURE",
+				apiAppId: "A_KITE_SHARED_APP",
+				eventId: "Ev_KITE_FIXTURE_APP_MENTION_001",
+			},
+		});
+	});
+
+	it("normalizes HTTP DMs into DM work", async () => {
+		const { bot, handleEvent } = createSlackBotHarness();
+		const result = dispatchFixturePayload(bot, readSlackHttpPayload("dm-message.json"));
+		await flushQueue();
+
+		expect(result).toMatchObject({
+			action: "queued",
+			slackEvent: {
+				channel: "D_ALICE_KITE",
+				text: "test-direct-response",
+				type: "dm",
+			},
+			scope: {
+				key: "D_ALICE_KITE",
+			},
+		});
+		expect(handleEvent).toHaveBeenCalledTimes(1);
+	});
+
+	it("logs non-DM channel messages without queuing work", async () => {
+		const { bot, handleEvent, workingDir } = createSlackBotHarness();
+		const result = dispatchFixturePayload(bot, readSlackHttpPayload("channel-message-log-only.json"));
+		await flushQueue();
+
+		expect(result).toMatchObject({ action: "logged", old: false, triggered: false });
+		expect(handleEvent).not.toHaveBeenCalled();
+		const logEntry = JSON.parse(readFileSync(join(workingDir, "C_GROWTH", "log.jsonl"), "utf8"));
+		expect(logEntry).toMatchObject({
+			text: "normal channel context for the log",
+			threadRootTs: "1714492820.000300",
+		});
+	});
+
+	it("preserves file-share metadata for attachment processing", async () => {
+		const { bot, handleEvent, processAttachments } = createSlackBotHarness();
+		const result = dispatchFixturePayload(bot, readSlackHttpPayload("file-share-dm.json"));
+		await flushQueue();
+
+		expect(result).toMatchObject({ action: "queued" });
+		expect(processAttachments).toHaveBeenCalledWith(
+			"D_ALICE_KITE",
+			expect.arrayContaining([
+				expect.objectContaining({
+					name: "people.csv",
+					mimetype: "text/csv",
+					url_private_download: expect.stringContaining("files.slack.com"),
+				}),
+			]),
+			"1714492830.000400",
+		);
+		expect(handleEvent.mock.calls[0][0].files?.[0]).toMatchObject({
+			name: "people.csv",
+			mimetype: "text/csv",
+		});
+	});
+
+	it("routes stop commands through immediate stop handling", async () => {
+		const { bot, handleEvent, handleStop } = createSlackBotHarness();
+		const result = dispatchFixturePayload(bot, readSlackHttpPayload("stop-command.json"));
+		await flushQueue();
+
+		expect(result).toMatchObject({
+			action: "stopped",
+			slackEvent: { channel: "C_GROWTH", text: "stop" },
+			scope: { key: "C_GROWTH:1714492800.000100", threadRootTs: "1714492800.000100" },
+		});
+		expect(handleStop).toHaveBeenCalledTimes(1);
+		expect(handleEvent).not.toHaveBeenCalled();
+	});
+
+	it("ignores bot-originated messages without logging or queuing", async () => {
+		const { bot, handleEvent, workingDir } = createSlackBotHarness();
+		const result = dispatchFixturePayload(bot, readSlackHttpPayload("bot-message-ignore.json"));
+		await flushQueue();
+
+		expect(result).toMatchObject({ action: "ignored", reason: "bot_message" });
+		expect(handleEvent).not.toHaveBeenCalled();
+		expect(existsSync(join(workingDir, "C_GROWTH", "log.jsonl"))).toBe(false);
+	});
+
+	it("logs old messages without triggering queued work", async () => {
+		const { bot, handleEvent, workingDir } = createSlackBotHarness();
+		(bot as any).startupTs = "9999999999.000000";
+		const result = dispatchFixturePayload(bot, readSlackHttpPayload("app-mention.json"));
+		await flushQueue();
+
+		expect(result).toMatchObject({ action: "logged", old: true, triggered: false });
+		expect(handleEvent).not.toHaveBeenCalled();
+		expect(readFileSync(join(workingDir, "C_GROWTH", "log.jsonl"), "utf8")).toContain("test-direct-response");
+	});
+});
 
 describe("mom slack queueing", () => {
 	it("runs a second mention thread after the first one finishes in the same channel", async () => {
@@ -92,7 +261,7 @@ describe("mom slack queueing", () => {
 			handled.push("end:second task");
 		});
 
-		await Promise.resolve();
+		await flushQueue();
 		expect(handled).toEqual(["start:first task"]);
 
 		releaseFirst();
@@ -115,7 +284,7 @@ describe("mom slack queueing", () => {
 			queue.enqueue(async () => {}, { conversationKey: `C123:${index}` });
 		}
 
-		await Promise.resolve();
+		await flushQueue();
 		expect(queue.size()).toBe(MAX_PENDING_CHANNEL_WORK);
 		expect(hasPendingChannelCapacity(queue)).toBe(false);
 
@@ -371,7 +540,7 @@ describe("mom slack queueing", () => {
 			{ conversationKey: "C123:3000.1" },
 		);
 
-		await Promise.resolve();
+		await flushQueue();
 		expect(handled).toEqual(["start:first thread"]);
 		expect(queue.cancelPending("C123:2000.1")).toBe(1);
 
@@ -379,5 +548,31 @@ describe("mom slack queueing", () => {
 		await flushQueue();
 
 		expect(handled).toEqual(["start:first thread", "end:first thread", "start:third thread", "end:third thread"]);
+	});
+
+	it("cancels scheduled work before the deferred processor starts it", async () => {
+		vi.useFakeTimers();
+		try {
+			const handled: string[] = [];
+			const queue = new ChannelQueue();
+
+			queue.enqueue(
+				async () => {
+					handled.push("start:scheduled thread");
+				},
+				{ conversationKey: "C123:1000.1" },
+			);
+
+			expect(queue.size()).toBe(0);
+			expect(queue.hasInFlightWork()).toBe(true);
+			expect(queue.cancelPending("C123:1000.1")).toBe(1);
+
+			await vi.advanceTimersByTimeAsync(5);
+
+			expect(handled).toEqual([]);
+			expect(queue.hasInFlightWork()).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

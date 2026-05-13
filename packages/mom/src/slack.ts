@@ -4,11 +4,37 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "fs";
 import { basename, join } from "path";
 import { type ConversationScope, resolveConversationScope, resolveExecutionChannelId } from "./conversation-scope.js";
 import * as log from "./log.js";
-import type { Attachment, ChannelStore, LoggedMessage } from "./store.js";
+import type { Attachment, ChannelStore, LoggedMessage, LoggedSlackMetadata } from "./store.js";
 
 // ============================================================================
 // Types
 // ============================================================================
+
+export interface SlackFile {
+	name?: string;
+	url_private_download?: string;
+	url_private?: string;
+	[key: string]: unknown;
+}
+
+export interface SlackAuthorization {
+	enterprise_id?: string | null;
+	team_id?: string | null;
+	user_id?: string;
+	is_bot?: boolean;
+	is_enterprise_install?: boolean;
+}
+
+export interface SlackEventMetadata {
+	ingress: "socket" | "http";
+	teamId?: string;
+	apiAppId?: string;
+	eventId?: string;
+	eventTime?: number;
+	authorizations?: SlackAuthorization[];
+	retryNum?: string;
+	retryReason?: string;
+}
 
 export interface SlackEvent {
 	type: "mention" | "dm";
@@ -17,9 +43,43 @@ export interface SlackEvent {
 	threadTs?: string;
 	user: string;
 	text: string;
-	files?: Array<{ name?: string; url_private_download?: string; url_private?: string }>;
+	files?: SlackFile[];
+	metadata?: SlackEventMetadata;
 	/** Processed attachments with local paths (populated after logUserMessage) */
 	attachments?: Attachment[];
+}
+
+export interface SlackCallbackDispatchInput {
+	ingress: "socket" | "http";
+	event: Record<string, unknown>;
+	metadata?: SlackEventMetadata;
+}
+
+export type SlackIgnoreReason =
+	| "not_initialized"
+	| "invalid_event"
+	| "unsupported_event_type"
+	| "dm_app_mention"
+	| "bot_message"
+	| "message_subtype"
+	| "empty_message"
+	| "duplicate_mention_message";
+
+export type SlackDispatchResult =
+	| { action: "ignored"; reason: SlackIgnoreReason; metadata?: SlackEventMetadata }
+	| { action: "logged"; slackEvent: SlackEvent; scope: ConversationScope; triggered: false; old: boolean }
+	| { action: "stopped"; slackEvent: SlackEvent; scope: ConversationScope }
+	| { action: "queued"; slackEvent: SlackEvent; scope: ConversationScope; accepted: boolean; queued: boolean };
+
+interface SlackNormalizationResult {
+	action: "event";
+	slackEvent: SlackEvent;
+	shouldTrigger: boolean;
+}
+
+interface SlackIgnoredNormalizationResult {
+	action: "ignored";
+	reason: SlackIgnoreReason;
 }
 
 export interface SlackUser {
@@ -55,6 +115,7 @@ export interface SlackContext {
 		ts: string;
 		threadTs?: string;
 		attachments: Array<{ local: string }>;
+		slack?: SlackEventMetadata;
 	};
 	channelName?: string;
 	isEvent?: boolean;
@@ -102,6 +163,7 @@ export function resolveLoggedThreadRootTs(
 type QueuedWork = () => Promise<void>;
 
 export const MAX_PENDING_CHANNEL_WORK = 5;
+const CHANNEL_QUEUE_PROCESS_DELAY_MS = 5;
 
 export function hasPendingChannelCapacity(queue: Pick<ChannelQueue, "size">): boolean {
 	return queue.size() < MAX_PENDING_CHANNEL_WORK;
@@ -115,10 +177,12 @@ interface QueuedWorkItem {
 export class ChannelQueue {
 	private queue: QueuedWorkItem[] = [];
 	private processing = false;
+	private processScheduled = false;
+	private activeWork?: QueuedWorkItem;
 
 	enqueue(work: QueuedWork, options?: { conversationKey?: string }): void {
 		this.queue.push({ work, conversationKey: options?.conversationKey });
-		this.processNext();
+		this.scheduleProcess();
 	}
 
 	hasInFlightWork(): boolean {
@@ -128,24 +192,50 @@ export class ChannelQueue {
 	cancelPending(conversationKey: string): number {
 		const originalLength = this.queue.length;
 		this.queue = this.queue.filter((item) => item.conversationKey !== conversationKey);
-		return originalLength - this.queue.length;
+		let cancelledCount = originalLength - this.queue.length;
+		if (this.processScheduled && this.activeWork?.conversationKey === conversationKey) {
+			this.activeWork = undefined;
+			cancelledCount += 1;
+		}
+		return cancelledCount;
 	}
 
 	size(): number {
 		return this.queue.length;
 	}
 
-	private async processNext(): Promise<void> {
-		if (this.processing || this.queue.length === 0) return;
+	private scheduleProcess(): void {
+		if (this.processing || this.processScheduled) {
+			return;
+		}
+		const nextWork = this.queue.shift();
+		if (!nextWork) {
+			return;
+		}
 		this.processing = true;
-		const { work } = this.queue.shift()!;
+		this.processScheduled = true;
+		this.activeWork = nextWork;
+		setTimeout(() => {
+			this.processScheduled = false;
+			void this.processActiveWork();
+		}, CHANNEL_QUEUE_PROCESS_DELAY_MS);
+	}
+
+	private async processActiveWork(): Promise<void> {
+		const item = this.activeWork;
+		if (!item) {
+			this.processing = false;
+			this.scheduleProcess();
+			return;
+		}
+		this.activeWork = undefined;
 		try {
-			await work();
+			await item.work();
 		} catch (err) {
 			log.logWarning("Queue error", err instanceof Error ? err.message : String(err));
 		}
 		this.processing = false;
-		this.processNext();
+		this.scheduleProcess();
 	}
 }
 
@@ -154,26 +244,24 @@ export class ChannelQueue {
 // ============================================================================
 
 export class SlackBot {
-	private socketClient: SocketModeClient;
+	private socketClient?: SocketModeClient;
 	private webClient: WebClient;
 	private handler: MomHandler;
 	private workingDir: string;
 	private store: ChannelStore;
 	private botUserId: string | null = null;
 	private startupTs: string | null = null; // Messages older than this are just logged, not processed
+	private initialized = false;
+	private initializePromise?: Promise<void>;
 
 	private users = new Map<string, SlackUser>();
 	private channels = new Map<string, SlackChannel>();
 	private queues = new Map<string, ChannelQueue>();
 
-	constructor(
-		handler: MomHandler,
-		config: { appToken: string; botToken: string; workingDir: string; store: ChannelStore },
-	) {
+	constructor(handler: MomHandler, config: { botToken: string; workingDir: string; store: ChannelStore }) {
 		this.handler = handler;
 		this.workingDir = config.workingDir;
 		this.store = config.store;
-		this.socketClient = new SocketModeClient({ appToken: config.appToken });
 		this.webClient = new WebClient(config.botToken);
 	}
 
@@ -181,21 +269,50 @@ export class SlackBot {
 	// Public API
 	// ==========================================================================
 
-	async start(): Promise<void> {
-		const auth = await this.webClient.auth.test();
-		this.botUserId = auth.user_id as string;
+	async initialize(): Promise<void> {
+		if (this.initialized) {
+			return;
+		}
+		if (!this.initializePromise) {
+			this.initializePromise = this.initializeRuntime().catch((error) => {
+				this.initializePromise = undefined;
+				this.botUserId = null;
+				this.users.clear();
+				this.channels.clear();
+				throw error;
+			});
+		}
+		await this.initializePromise;
+	}
 
-		await Promise.all([this.fetchUsers(), this.fetchChannels()]);
-		log.logInfo(`Loaded ${this.channels.size} channels, ${this.users.size} users`);
-
-		await this.backfillAllChannels();
-
+	async startSocketMode(appToken: string): Promise<void> {
+		await this.initialize();
+		this.socketClient = new SocketModeClient({ appToken });
 		this.setupEventHandlers();
 		await this.socketClient.start();
+		this.markIngressListening();
+	}
 
+	async stopSocketMode(): Promise<void> {
+		if (!this.socketClient) {
+			return;
+		}
+		const socketClient = this.socketClient as unknown as {
+			disconnect?: () => Promise<void> | void;
+			close?: () => Promise<void> | void;
+		};
+		if (socketClient.disconnect) {
+			await socketClient.disconnect();
+			return;
+		}
+		if (socketClient.close) {
+			await socketClient.close();
+		}
+	}
+
+	markIngressListening(): void {
 		// Record startup time - messages older than this are just logged, not processed
 		this.startupTs = (Date.now() / 1000).toFixed(6);
-
 		log.logConnected();
 	}
 
@@ -276,6 +393,62 @@ export class SlackBot {
 		});
 	}
 
+	/**
+	 * Dispatches normalized Slack callback events from either Socket Mode or HTTP Events API ingress.
+	 * This method performs only synchronous log/queue/stop setup and never waits for runner execution.
+	 */
+	dispatchSlackCallbackEvent(input: SlackCallbackDispatchInput): SlackDispatchResult {
+		if (!this.botUserId) {
+			return { action: "ignored", reason: "not_initialized", metadata: input.metadata };
+		}
+
+		const normalization = normalizeSlackCallbackEvent({
+			event: input.event,
+			botUserId: this.botUserId,
+			metadata: input.metadata ?? { ingress: input.ingress },
+		});
+		if (normalization.action === "ignored") {
+			return { action: "ignored", reason: normalization.reason, metadata: input.metadata };
+		}
+
+		const { slackEvent, shouldTrigger } = normalization;
+		const scope = resolveConversationScope(slackEvent);
+
+		// SYNC: Log to log.jsonl (ALWAYS, even for old messages)
+		// Also downloads attachments in background and stores local paths
+		slackEvent.attachments = this.logUserMessage(slackEvent, scope);
+
+		// Only trigger processing for messages AFTER startup (not replayed old messages)
+		if (this.startupTs && slackEvent.ts < this.startupTs) {
+			log.logInfo(
+				`[${slackEvent.channel}] Logged old message (pre-startup), not triggering: ${slackEvent.text.substring(0, 30)}`,
+			);
+			return { action: "logged", slackEvent, scope, triggered: false, old: true };
+		}
+
+		if (!shouldTrigger) {
+			return { action: "logged", slackEvent, scope, triggered: false, old: false };
+		}
+
+		// Check for stop command - execute immediately, don't queue!
+		if (slackEvent.text.toLowerCase().trim() === "stop") {
+			void this.handler.handleStop(slackEvent, scope, this).catch((error) => {
+				log.logWarning("Stop handler error", error instanceof Error ? error.message : String(error));
+			});
+			return { action: "stopped", slackEvent, scope };
+		}
+
+		const enqueueResult = this.enqueueConversationEvent(slackEvent, scope);
+		if (!enqueueResult.accepted) {
+			log.logWarning(`[${scope.key}] Queue full`, `Rejecting Slack work: ${slackEvent.text.substring(0, 50)}`);
+			this.postQueueFullReply(slackEvent.channel, scope.threadRootTs);
+		} else if (enqueueResult.queued) {
+			this.postQueuedReply(slackEvent.channel, scope.threadRootTs);
+		}
+
+		return { action: "queued", slackEvent, scope, accepted: enqueueResult.accepted, queued: enqueueResult.queued };
+	}
+
 	// ==========================================================================
 	// Events Integration
 	// ==========================================================================
@@ -299,6 +472,17 @@ export class SlackBot {
 	// ==========================================================================
 	// Private - Event Handlers
 	// ==========================================================================
+
+	private async initializeRuntime(): Promise<void> {
+		const auth = await this.webClient.auth.test();
+		this.botUserId = auth.user_id as string;
+
+		await Promise.all([this.fetchUsers(), this.fetchChannels()]);
+		log.logInfo(`Loaded ${this.channels.size} channels, ${this.users.size} users`);
+
+		await this.backfillAllChannels();
+		this.initialized = true;
+	}
 
 	private getQueue(channelId: string): ChannelQueue {
 		let queue = this.queues.get(channelId);
@@ -350,147 +534,34 @@ export class SlackBot {
 	}
 
 	private setupEventHandlers(): void {
+		if (!this.socketClient) {
+			throw new Error("Socket Mode client is not configured");
+		}
+
 		// Channel @mentions
-		this.socketClient.on("app_mention", ({ event, ack }) => {
-			const e = event as {
-				text: string;
-				channel: string;
-				user: string;
-				ts: string;
-				thread_ts?: string;
-				files?: Array<{ name: string; url_private_download?: string; url_private?: string }>;
-			};
-
-			// Skip DMs (handled by message event)
-			if (e.channel.startsWith("D")) {
-				ack();
-				return;
-			}
-
-			const slackEvent: SlackEvent = {
-				type: "mention",
-				channel: e.channel,
-				ts: e.ts,
-				threadTs: e.thread_ts,
-				user: e.user,
-				text: e.text.replace(/<@[A-Z0-9]+>/gi, "").trim(),
-				files: e.files,
-			};
-			const scope = resolveConversationScope(slackEvent);
-
-			// SYNC: Log to log.jsonl (ALWAYS, even for old messages)
-			// Also downloads attachments in background and stores local paths
-			slackEvent.attachments = this.logUserMessage(slackEvent, scope);
-
-			// Only trigger processing for messages AFTER startup (not replayed old messages)
-			if (this.startupTs && e.ts < this.startupTs) {
-				log.logInfo(
-					`[${e.channel}] Logged old message (pre-startup), not triggering: ${slackEvent.text.substring(0, 30)}`,
-				);
-				ack();
-				return;
-			}
-
-			// Check for stop command - execute immediately, don't queue!
-			if (slackEvent.text.toLowerCase().trim() === "stop") {
-				void this.handler.handleStop(slackEvent, scope, this).catch((error) => {
-					log.logWarning("Stop handler error", error instanceof Error ? error.message : String(error));
-				});
-				ack();
-				return;
-			}
-
-			const enqueueResult = this.enqueueConversationEvent(slackEvent, scope);
-			if (!enqueueResult.accepted) {
-				log.logWarning(`[${scope.key}] Queue full`, `Rejecting Slack work: ${slackEvent.text.substring(0, 50)}`);
-				this.postQueueFullReply(e.channel, scope.threadRootTs);
-			} else if (enqueueResult.queued) {
-				this.postQueuedReply(e.channel, scope.threadRootTs);
-			}
-
-			ack();
+		this.socketClient.on("app_mention", ({ event, ack }: { event: unknown; ack: () => Promise<void> | void }) => {
+			const eventRecord = typeof event === "object" && event !== null ? (event as Record<string, unknown>) : {};
+			this.dispatchSlackCallbackEvent({
+				ingress: "socket",
+				event: { ...eventRecord, type: "app_mention" },
+				metadata: { ingress: "socket" },
+			});
+			void Promise.resolve(ack()).catch((error) => {
+				log.logWarning("Slack ack error", error instanceof Error ? error.message : String(error));
+			});
 		});
 
 		// All messages (for logging) + DMs (for triggering)
-		this.socketClient.on("message", ({ event, ack }) => {
-			const e = event as {
-				text?: string;
-				channel: string;
-				user?: string;
-				ts: string;
-				thread_ts?: string;
-				channel_type?: string;
-				subtype?: string;
-				bot_id?: string;
-				files?: Array<{ name: string; url_private_download?: string; url_private?: string }>;
-			};
-
-			// Skip bot messages, edits, etc.
-			if (e.bot_id || !e.user || e.user === this.botUserId) {
-				ack();
-				return;
-			}
-			if (e.subtype !== undefined && e.subtype !== "file_share") {
-				ack();
-				return;
-			}
-			if (!e.text && (!e.files || e.files.length === 0)) {
-				ack();
-				return;
-			}
-
-			const isDM = e.channel_type === "im";
-			const isBotMention = e.text?.includes(`<@${this.botUserId}>`);
-
-			// Skip channel @mentions - already handled by app_mention event
-			if (!isDM && isBotMention) {
-				ack();
-				return;
-			}
-
-			const slackEvent: SlackEvent = {
-				type: isDM ? "dm" : "mention",
-				channel: e.channel,
-				ts: e.ts,
-				threadTs: e.thread_ts,
-				user: e.user,
-				text: (e.text || "").replace(/<@[A-Z0-9]+>/gi, "").trim(),
-				files: e.files,
-			};
-			const scope = resolveConversationScope(slackEvent);
-
-			// SYNC: Log to log.jsonl (ALL messages - channel chatter and DMs)
-			// Also downloads attachments in background and stores local paths
-			slackEvent.attachments = this.logUserMessage(slackEvent, scope);
-
-			// Only trigger processing for messages AFTER startup (not replayed old messages)
-			if (this.startupTs && e.ts < this.startupTs) {
-				log.logInfo(`[${e.channel}] Skipping old message (pre-startup): ${slackEvent.text.substring(0, 30)}`);
-				ack();
-				return;
-			}
-
-			// Only trigger handler for DMs
-			if (isDM) {
-				// Check for stop command - execute immediately, don't queue!
-				if (slackEvent.text.toLowerCase().trim() === "stop") {
-					void this.handler.handleStop(slackEvent, scope, this).catch((error) => {
-						log.logWarning("Stop handler error", error instanceof Error ? error.message : String(error));
-					});
-					ack();
-					return;
-				}
-
-				const enqueueResult = this.enqueueConversationEvent(slackEvent, scope);
-				if (!enqueueResult.accepted) {
-					log.logWarning(`[${scope.key}] Queue full`, `Rejecting Slack work: ${slackEvent.text.substring(0, 50)}`);
-					this.postQueueFullReply(e.channel, scope.threadRootTs);
-				} else if (enqueueResult.queued) {
-					this.postQueuedReply(e.channel, scope.threadRootTs);
-				}
-			}
-
-			ack();
+		this.socketClient.on("message", ({ event, ack }: { event: unknown; ack: () => Promise<void> | void }) => {
+			const eventRecord = typeof event === "object" && event !== null ? (event as Record<string, unknown>) : {};
+			this.dispatchSlackCallbackEvent({
+				ingress: "socket",
+				event: { ...eventRecord, type: "message" },
+				metadata: { ingress: "socket" },
+			});
+			void Promise.resolve(ack()).catch((error) => {
+				log.logWarning("Slack ack error", error instanceof Error ? error.message : String(error));
+			});
 		});
 	}
 
@@ -512,6 +583,7 @@ export class SlackBot {
 			attachments,
 			isBot: false,
 			threadRootTs: resolveLoggedThreadRootTs(event.channel, event.ts, scope.threadRootTs),
+			slack: toLoggedSlackMetadata(event.metadata),
 		});
 		return attachments;
 	}
@@ -552,7 +624,7 @@ export class SlackBot {
 			ts?: string;
 			thread_ts?: string;
 			subtype?: string;
-			files?: Array<{ name: string }>;
+			files?: SlackFile[];
 		};
 		const allMessages: Message[] = [];
 
@@ -709,4 +781,119 @@ export class SlackBot {
 			cursor = result.response_metadata?.next_cursor;
 		} while (cursor);
 	}
+}
+
+export function normalizeSlackCallbackEvent(input: {
+	event: Record<string, unknown>;
+	botUserId: string;
+	metadata?: SlackEventMetadata;
+}): SlackNormalizationResult | SlackIgnoredNormalizationResult {
+	const eventType = typeof input.event.type === "string" ? input.event.type : undefined;
+	if (eventType === "app_mention") {
+		return normalizeAppMention(input.event, input.metadata);
+	}
+	if (eventType === "message") {
+		return normalizeMessage(input.event, input.botUserId, input.metadata);
+	}
+	return { action: "ignored", reason: "unsupported_event_type" };
+}
+
+function normalizeAppMention(
+	event: Record<string, unknown>,
+	metadata: SlackEventMetadata | undefined,
+): SlackNormalizationResult | SlackIgnoredNormalizationResult {
+	const channel = typeof event.channel === "string" ? event.channel : undefined;
+	const user = typeof event.user === "string" ? event.user : undefined;
+	const ts = typeof event.ts === "string" ? event.ts : undefined;
+	if (!channel || !user || !ts) {
+		return { action: "ignored", reason: "invalid_event" };
+	}
+	if (channel.startsWith("D")) {
+		return { action: "ignored", reason: "dm_app_mention" };
+	}
+
+	const text = typeof event.text === "string" ? event.text : "";
+	return {
+		action: "event",
+		shouldTrigger: true,
+		slackEvent: {
+			type: "mention",
+			channel,
+			ts,
+			threadTs: typeof event.thread_ts === "string" ? event.thread_ts : undefined,
+			user,
+			text: text.replace(/<@[A-Z0-9_]+>/gi, "").trim(),
+			files: normalizeFiles(event.files),
+			metadata,
+		},
+	};
+}
+
+function normalizeMessage(
+	event: Record<string, unknown>,
+	botUserId: string,
+	metadata: SlackEventMetadata | undefined,
+): SlackNormalizationResult | SlackIgnoredNormalizationResult {
+	const user = typeof event.user === "string" ? event.user : undefined;
+	if (typeof event.bot_id === "string" || !user || user === botUserId) {
+		return { action: "ignored", reason: "bot_message" };
+	}
+	const subtype = typeof event.subtype === "string" ? event.subtype : undefined;
+	if (subtype !== undefined && subtype !== "file_share") {
+		return { action: "ignored", reason: "message_subtype" };
+	}
+
+	const text = typeof event.text === "string" ? event.text : "";
+	const files = normalizeFiles(event.files);
+	if (!text && (!files || files.length === 0)) {
+		return { action: "ignored", reason: "empty_message" };
+	}
+
+	const channel = typeof event.channel === "string" ? event.channel : undefined;
+	const ts = typeof event.ts === "string" ? event.ts : undefined;
+	if (!channel || !ts) {
+		return { action: "ignored", reason: "invalid_event" };
+	}
+
+	const isDM = event.channel_type === "im";
+	const isBotMention = text.includes(`<@${botUserId}>`);
+	if (!isDM && isBotMention) {
+		return { action: "ignored", reason: "duplicate_mention_message" };
+	}
+
+	return {
+		action: "event",
+		shouldTrigger: isDM,
+		slackEvent: {
+			type: isDM ? "dm" : "mention",
+			channel,
+			ts,
+			threadTs: typeof event.thread_ts === "string" ? event.thread_ts : undefined,
+			user,
+			text: text.replace(/<@[A-Z0-9_]+>/gi, "").trim(),
+			files,
+			metadata,
+		},
+	};
+}
+
+function normalizeFiles(value: unknown): SlackFile[] | undefined {
+	if (!Array.isArray(value)) {
+		return undefined;
+	}
+	const files = value.filter((file): file is SlackFile => typeof file === "object" && file !== null);
+	return files.length > 0 ? files : undefined;
+}
+
+function toLoggedSlackMetadata(metadata: SlackEventMetadata | undefined): LoggedSlackMetadata | undefined {
+	if (!metadata) {
+		return undefined;
+	}
+	return {
+		ingress: metadata.ingress,
+		teamId: metadata.teamId,
+		apiAppId: metadata.apiAppId,
+		eventId: metadata.eventId,
+		eventTime: metadata.eventTime,
+	};
 }

@@ -20,6 +20,7 @@ import {
 	tryParseMomDisplayInstruction,
 } from "./display-control.js";
 import * as log from "./log.js";
+import type { SlackEventMetadata } from "./slack.js";
 
 type StartupModelSelectSource = "set" | "cycle" | "restore";
 
@@ -52,6 +53,7 @@ interface MomAugmentedExtensionContext extends ExtensionContext {
 		threadTs?: string;
 		text: string;
 		attachments: string[];
+		slack?: SlackEventMetadata;
 	};
 }
 
@@ -90,6 +92,7 @@ export interface MomRequestContext {
 	rawText: string;
 	attachments: string[];
 	isEvent: boolean;
+	slack?: SlackEventMetadata;
 }
 
 export interface MomSlackMessageCallbacks {
@@ -227,9 +230,6 @@ export function createMomExtensionBridge(
 	currentModelRef: { current: Model<any> },
 ): MomExtensionBridge {
 	const runner = session.extensionRunner;
-	if (!runner) {
-		return createNoOpBridge();
-	}
 
 	let requestContext: MomRequestContext | undefined;
 	let displayState: MomDisplayState | undefined;
@@ -279,18 +279,12 @@ export function createMomExtensionBridge(
 			return;
 		}
 
-		if (message.customType === DIRECT_RESPONSE_CUSTOM_TYPE) {
-			enqueueSlackEffect(async () => {
-				await renderCustomMessageToSlack(message, callbacks);
-			});
-			return;
-		}
-
+		const persistableMessage = createPersistableCustomMessage(message);
 		enqueueSlackEffect(async () => {
 			try {
 				await renderCustomMessageToSlack(message, callbacks);
 			} finally {
-				originalSendMessage(message, options);
+				originalSendMessage(persistableMessage, options);
 			}
 		});
 	};
@@ -347,22 +341,6 @@ export function createMomExtensionBridge(
 	};
 }
 
-function createNoOpBridge(): MomExtensionBridge {
-	return {
-		setRequestContext(): void {},
-		clearRequestContext(): void {},
-		setDisplayState(): void {},
-		clearDisplayState(): void {},
-		setSlackCallbacks(): void {},
-		clearSlackCallbacks(): void {},
-		async emitRawInput(): Promise<InputEventResult> {
-			return { action: "continue" };
-		},
-		async emitStartupModelSelect(): Promise<void> {},
-		async flushPendingSlackEffects(): Promise<void> {},
-	};
-}
-
 function patchCreateContext(runner: ExtensionRunner, getRequestContext: () => MomRequestContext | undefined): void {
 	const backdoor = runner as unknown as RuntimeBackdoor;
 	const originalCreateContext = backdoor.createContext.bind(runner);
@@ -389,6 +367,7 @@ function patchCreateContext(runner: ExtensionRunner, getRequestContext: () => Mo
 			threadTs: requestContext.threadTs,
 			text: requestContext.rawText,
 			attachments: requestContext.attachments,
+			slack: requestContext.slack,
 		};
 		return context;
 	};
@@ -396,6 +375,25 @@ function patchCreateContext(runner: ExtensionRunner, getRequestContext: () => Mo
 
 function getRunnerRuntime(runner: ExtensionRunner): ExtensionRuntime {
 	return (runner as unknown as RuntimeBackdoor).runtime;
+}
+
+function createPersistableCustomMessage(message: RuntimeCustomMessage): RuntimeCustomMessage {
+	if (message.customType !== DIRECT_RESPONSE_CUSTOM_TYPE || !isSlackDirectResponseContent(message.content)) {
+		return message;
+	}
+
+	return {
+		...message,
+		content: formatSlackDirectResponseForContext(message.content),
+	};
+}
+
+function formatSlackDirectResponseForContext(content: SlackDirectResponseContent): string {
+	const parts = [content.mainText];
+	if (content.threadText) {
+		parts.push(content.threadText);
+	}
+	return parts.join("\n\n");
 }
 
 async function renderCustomMessageToSlack(

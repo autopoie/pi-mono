@@ -8,6 +8,14 @@ export interface Attachment {
 	local: string; // path relative to working dir (e.g., "C12345/attachments/1732531234567_file.png")
 }
 
+export interface LoggedSlackMetadata {
+	ingress: "socket" | "http";
+	teamId?: string;
+	apiAppId?: string;
+	eventId?: string;
+	eventTime?: number;
+}
+
 export interface LoggedMessage {
 	date: string; // ISO 8601 date (e.g., "2025-11-26T10:44:00.000Z") for easy grepping
 	ts: string; // slack timestamp or epoch ms
@@ -18,6 +26,7 @@ export interface LoggedMessage {
 	attachments: Attachment[];
 	isBot: boolean;
 	threadRootTs?: string; // normalized Slack thread root for channel-thread messages
+	slack?: LoggedSlackMetadata;
 }
 
 export interface ChannelStoreConfig {

@@ -187,32 +187,48 @@ describe("mom display control", () => {
 		expect(delegatedMessages).toEqual([]);
 	});
 
-	it("renders mom-direct-response to Slack without delegating it upstream", async () => {
+	it("renders mom-direct-response to Slack and delegates it for custom-message persistence", async () => {
 		const { bridge, delegatedMessages, fakeRuntime, originalSendMessage } = createBridgeHarness();
+		const clearThinking = vi.fn();
+		const markCustomResponseHandled = vi.fn();
 		const publishFinal = vi.fn(async () => {});
 		const respondInThread = vi.fn(async () => {});
-
-		bridge.setSlackCallbacks({
-			clearThinking: vi.fn(),
-			markCustomResponseHandled: vi.fn(),
-			publishFinal,
-			respond: vi.fn(async () => {}),
-			respondInThread,
-		});
-
-		fakeRuntime.sendMessage({
+		const message = {
 			customType: "mom-direct-response",
 			content: {
 				mainText: "direct response ok",
 				threadText: "thread response ok",
 			},
 			display: false,
-		} as RuntimeMessage);
+		} as RuntimeMessage;
+
+		bridge.setSlackCallbacks({
+			clearThinking,
+			markCustomResponseHandled,
+			publishFinal,
+			respond: vi.fn(async () => {}),
+			respondInThread,
+		});
+
+		fakeRuntime.sendMessage(message);
 		await bridge.flushPendingSlackEffects();
 
+		expect(clearThinking).toHaveBeenCalledTimes(1);
+		expect(markCustomResponseHandled).toHaveBeenCalledTimes(1);
 		expect(publishFinal).toHaveBeenCalledWith("direct response ok", true);
 		expect(respondInThread).toHaveBeenCalledWith("thread response ok");
-		expect(originalSendMessage).not.toHaveBeenCalled();
-		expect(delegatedMessages).toEqual([]);
+		expect(originalSendMessage).toHaveBeenCalledWith(
+			{
+				...message,
+				content: "direct response ok\n\nthread response ok",
+			},
+			undefined,
+		);
+		expect(delegatedMessages).toEqual([
+			{
+				...message,
+				content: "direct response ok\n\nthread response ok",
+			},
+		]);
 	});
 });
